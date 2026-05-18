@@ -4,7 +4,6 @@
 // ---------------------------------------------------------
 #include <windows.h>
 #include <dinput.h>
-#include <Xinput.h>
 #include <initguid.h> 
 #include "MinHook.h"
 #include <fstream>
@@ -14,7 +13,6 @@
 
 #pragma comment(lib, "dinput8.lib")
 #pragma comment(lib, "dxguid.lib")
-#pragma comment(lib, "Xinput.lib")
 
 // --- Logger ---
 std::ofstream g_Log;
@@ -28,12 +26,6 @@ void Log(const std::string& message) {
     }
 }
 
-void LogHex(const std::string& prefix, DWORD value) {
-    char buf[128];
-    snprintf(buf, sizeof(buf), "%s0x%02X", prefix.c_str(), value);
-    Log(buf);
-}
-
 // --- Engine Pointers & State ---
 namespace Retail {
     constexpr ptrdiff_t OFFSET_CWORLD_IN_GUI = 0x04;
@@ -44,15 +36,17 @@ namespace Retail {
     constexpr ptrdiff_t OFFSET_ILLUSTRATORS = 0x2C0;
 
     constexpr uintptr_t ADDR_PGUIDEF_GLOBAL = 0x013B878C;
-
     constexpr uintptr_t ADDR_CPLAYERGUI_UPDATE = 0x0043A080;
     constexpr uintptr_t ADDR_CONSTRUCT_XBOX_ABILITY = 0x00651A7E;
     constexpr uintptr_t ADDR_CONSTRUCT_XBOX_QUICKACCESS = 0x00652F0A;
     constexpr uintptr_t ADDR_CCHARSTRING_CONSTRUCT = 0x0099EBF0;
 
+    // Core Engine Input Vectors
+    constexpr uintptr_t ADDR_CINPUTMANAGER_UPDATE = 0x009F57A0;
+    constexpr uintptr_t ADDR_GFGETTIME = 0x009E1BC0;
+
     constexpr uintptr_t ADDR_GETDEF_CAMERA = 0x0043FF30;
     constexpr uintptr_t ADDR_SET_CAMERA_MANAGER_DEF = 0x0069A850;
-
     constexpr uintptr_t ADDR_GETDEF_CONTROLS = 0x00410820;
     constexpr uintptr_t ADDR_APPLY_VALUES = 0x00407370;
     constexpr uintptr_t ADDR_USER_PROFILE_GET = 0x0040D2A0;
@@ -60,12 +54,34 @@ namespace Retail {
     constexpr uintptr_t ADDR_ISTOGGLE_ZTARGET = 0x00445B80;
     constexpr uintptr_t ADDR_ISTOGGLE_SNEAK = 0x00000000;
     constexpr uintptr_t ADDR_ISTOGGLE_SPELLS = 0x00000000;
+
+    // Quick Access & Contextual UI Logic Hooks
+    constexpr uintptr_t ADDR_IS_QUICK_ACCESS = 0x004460C0;
+    constexpr uintptr_t ADDR_IS_CONTEXT_SENSITIVE = 0x004461D0;
+    constexpr uintptr_t ADDR_DRAW_ICON = 0x00645292;
 }
 
 // --- Hotswap Global State ---
 bool g_IsControllerActive = false;
 bool g_LastControllerState = false;
 bool g_ShadowObjectsInitialized = false;
+
+// Tooltip Backups
+bool g_OriginalTooltipEnabled = true;
+bool g_OriginalTooltipNew = true;
+
+// --- DirectInput & Vector Injection State ---
+#define DPAD_MASK_UP    0x0001
+#define DPAD_MASK_DOWN  0x0002
+#define DPAD_MASK_LEFT  0x0004
+#define DPAD_MASK_RIGHT 0x0008
+
+WORD g_CurrentDPadMask = 0;
+WORD g_LastDPadMask = 0;
+bool g_RightTriggerHeld = false;
+
+void* g_pInputManager = nullptr;
+bool g_InjectedThisFrame = false;
 
 static char g_XboxAbilityBuffer[256];
 static char g_XboxQuickAccessBuffer[256];
@@ -81,23 +97,27 @@ void* g_CurrentActiveCameraDef = nullptr;
 void* g_PCControlDef = nullptr;
 void* g_XboxControlDef = nullptr;
 
-char g_PCPassiveBackup[12];
-char g_PCAggressiveBackup[12];
+char g_PCPassiveBackup[16];
+char g_PCAggressiveBackup[16];
 
 IDirectInputDevice8W* g_pMouse = nullptr;
 IDirectInputDevice8W* g_pKeyboard = nullptr;
-static DWORD g_LastDpadButtonOffset = 0;
 
 // --- Function Typedefs ---
 typedef void(__thiscall* CPlayerGui_Update_t)(void* _this, bool paused);
 CPlayerGui_Update_t o_CPlayerGui_Update = nullptr;
+
+typedef void(__thiscall* CInputManager_Update_t)(void* _this);
+CInputManager_Update_t o_CInputManager_Update = nullptr;
+
+typedef double(*GFGetTime_t)();
+GFGetTime_t GFGetTime = (GFGetTime_t)Retail::ADDR_GFGETTIME;
 
 typedef void* (__thiscall* CCharString_Construct_t)(void* _this, const char* str, long len);
 CCharString_Construct_t o_CCharString_Construct = nullptr;
 
 typedef void(__thiscall* ConstructAbility_t)(void* _this, void* playerGui, void* illustrators);
 typedef void(__thiscall* ConstructQuick_t)(void* _this, void* playerGui, void* illustrators);
-
 typedef void(__thiscall* GetDef_t)(void* _this, void* pString, void* pOutDef);
 typedef void(__thiscall* SetCameraManagerDef_t)(void* _this, void** new_def);
 SetCameraManagerDef_t o_SetCameraManagerDef = nullptr;
@@ -110,10 +130,136 @@ IsToggle_t o_IsToggleZTarget = nullptr;
 IsToggle_t o_IsToggleSneak = nullptr;
 IsToggle_t o_IsToggleSpells = nullptr;
 
+typedef bool(__thiscall* IsEventInQueue_t)(void* _this, long item_index, int event_type, int device_number);
+IsEventInQueue_t o_IsContextSensitive = nullptr;
+IsEventInQueue_t o_IsQuickAccess = nullptr;
+
+typedef void(__thiscall* DrawIcon_t)(void* _this, void* info, void* tlpos, float alpha, int primitive_index, int back_graphic, int icon_graphic, bool special);
+DrawIcon_t o_DrawIcon = nullptr;
 
 // =================================================================================
-// 1. THE DEFINITION & LOGIC INTERCEPTORS 
+// 1. ENGINE MEMORY STRUCTURES
 // =================================================================================
+
+#pragma pack(push, 1)
+struct EngineInputEvent {
+    uint8_t  Pad0[8];
+    uint8_t  JoystickButton;
+    uint8_t  Pad1[3];
+    float    JoystickPressure;
+    uint8_t  Pad2[8];
+    float    MousePosX;
+    float    MousePosY;
+    uint32_t DeviceType;
+    uint32_t DeviceNumber;
+    uint32_t EventType;
+    float    CurrentTime;
+    float    StartTime;
+}; // Exactly 52 Bytes (0x34)
+#pragma pack(pop)
+
+// =================================================================================
+// 2. THE D-PAD VECTOR INJECTOR
+// =================================================================================
+
+void PushEventToVector(void* pInputManager, uint8_t buttonId, uint32_t eventType, uint32_t deviceNum) {
+    EngineInputEvent** _Myfirst = (EngineInputEvent**)((uintptr_t)pInputManager + 0x10);
+    EngineInputEvent** _Mylast = (EngineInputEvent**)((uintptr_t)pInputManager + 0x14);
+    EngineInputEvent** _Myend = (EngineInputEvent**)((uintptr_t)pInputManager + 0x18);
+    int* NoStoredEvents = (int*)((uintptr_t)pInputManager + 0x1C);
+
+    if (!_Mylast || !_Myend || *_Mylast == nullptr || *_Mylast >= *_Myend) return;
+
+    EngineInputEvent* newEvent = *_Mylast;
+    memset(newEvent, 0, sizeof(EngineInputEvent));
+
+    float engineTime = (float)GFGetTime();
+    float pressure = (eventType == 21) ? 0.0f : 1.0f;
+
+    newEvent->JoystickButton = buttonId;
+    newEvent->JoystickPressure = pressure;
+    newEvent->DeviceType = 1;
+    newEvent->DeviceNumber = deviceNum;
+    newEvent->EventType = eventType;
+
+    newEvent->CurrentTime = engineTime;
+    newEvent->StartTime = engineTime;
+
+    *_Mylast = (EngineInputEvent*)((uintptr_t)(*_Mylast) + sizeof(EngineInputEvent));
+    (*NoStoredEvents)++;
+}
+
+void ProcessDPadInjection() {
+    if (!g_pInputManager || !g_IsControllerActive) return;
+
+    auto EvaluateAndInject = [&](WORD mask, uint8_t btnId, const char* name) {
+        bool isHeld = (g_CurrentDPadMask & mask) != 0;
+        bool wasHeld = (g_LastDPadMask & mask) != 0;
+
+        uint32_t eventType = 0;
+
+        if (isHeld && !wasHeld) { eventType = 19; }
+        else if (isHeld && wasHeld) { eventType = 20; }
+        else if (!isHeld && wasHeld) { eventType = 21; }
+
+        if (eventType != 0) {
+            PushEventToVector(g_pInputManager, btnId, eventType, 0);
+            PushEventToVector(g_pInputManager, btnId, eventType, 1);
+            PushEventToVector(g_pInputManager, btnId, eventType, 2);
+        }
+        };
+
+    EvaluateAndInject(DPAD_MASK_UP, 13, "UP");
+    EvaluateAndInject(DPAD_MASK_DOWN, 14, "DOWN");
+    EvaluateAndInject(DPAD_MASK_LEFT, 15, "LEFT");
+    EvaluateAndInject(DPAD_MASK_RIGHT, 16, "RIGHT");
+}
+
+void __fastcall Hooked_CInputManager_Update(void* _this, void* edx) {
+    g_pInputManager = _this;
+    g_LastDPadMask = g_CurrentDPadMask;
+    g_InjectedThisFrame = false;
+
+    o_CInputManager_Update(_this);
+
+    if (!g_InjectedThisFrame) {
+        ProcessDPadInjection();
+    }
+}
+
+// =================================================================================
+// 3. THE DEFINITION, UI, & LOGIC INTERCEPTORS 
+// =================================================================================
+
+bool __fastcall Hooked_IsContextSensitive(void* _this, void* edx, long item_index, int event_type, int device_number) {
+    if (g_IsControllerActive && g_RightTriggerHeld) {
+        return false;
+    }
+    return o_IsContextSensitive(_this, item_index, event_type, device_number);
+}
+
+bool __fastcall Hooked_IsQuickAccess(void* _this, void* edx, long item_index, int event_type, int device_number) {
+    if (g_IsControllerActive && g_RightTriggerHeld) {
+        if (item_index == 0) return (g_CurrentDPadMask & DPAD_MASK_UP) != 0;
+        if (item_index == 1) return (g_CurrentDPadMask & DPAD_MASK_DOWN) != 0;
+        if (item_index == 2) return (g_CurrentDPadMask & DPAD_MASK_LEFT) != 0;
+        if (item_index == 3) return (g_CurrentDPadMask & DPAD_MASK_RIGHT) != 0;
+    }
+    return o_IsQuickAccess(_this, item_index, event_type, device_number);
+}
+
+void __fastcall Hooked_DrawIcon(void* _this, void* edx, void* info, void* tlpos, float alpha, int primitive_index, int back_graphic, int icon_graphic, bool special) {
+    if (g_IsControllerActive) {
+        if (g_RightTriggerHeld) {
+            alpha = special ? 1.0f : 0.0f;
+        }
+        else {
+            alpha = special ? 0.0f : 1.0f;
+        }
+    }
+    o_DrawIcon(_this, info, tlpos, alpha, primitive_index, back_graphic, icon_graphic, special);
+}
+
 bool __fastcall Hooked_IsToggleZTarget(void* _this, void* edx) {
     if (g_IsControllerActive) return false;
     return o_IsToggleZTarget(_this);
@@ -159,10 +305,10 @@ void __fastcall Hooked_SetCameraManagerDef(void* _this, void* edx, void** new_de
     o_SetCameraManagerDef(_this, override_def);
 }
 
+// =================================================================================
+// 4. THE CORE UPDATE LOOP & LIVE PUPPETEER
+// =================================================================================
 
-// =================================================================================
-// 2. THE CORE UPDATE LOOP & LIVE PUPPETEER
-// =================================================================================
 void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
 
     static void* g_LastPlayerGuiInstance = nullptr;
@@ -227,7 +373,6 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
     if (requestedState != g_LastControllerState) {
         g_LastControllerState = requestedState;
 
-        // --- 1. Swap the GUI ---
         void** pGlobalGuiDef = (void**)Retail::ADDR_PGUIDEF_GLOBAL;
         if (pGlobalGuiDef && *pGlobalGuiDef != nullptr) *pGlobalGuiDef = nullptr;
 
@@ -237,7 +382,6 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
         if (requestedState) {
             if (!g_PCAbilityButtons) g_PCAbilityButtons = *currentAbilityPtr;
             if (!g_PCQuickAccessIcons) g_PCQuickAccessIcons = *currentQuickAccessPtr;
-
             *currentAbilityPtr = g_XboxAbilityBuffer;
             *currentQuickAccessPtr = g_XboxQuickAccessBuffer;
         }
@@ -246,13 +390,11 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
             if (g_PCQuickAccessIcons) *currentQuickAccessPtr = g_PCQuickAccessIcons;
         }
 
-        // --- 2. Swap the Camera ---
         void* pWorld = *(void**)((uintptr_t)_this + Retail::OFFSET_CWORLD_IN_GUI);
         if (pWorld) {
             void* pCameraManager = *(void**)((uintptr_t)pWorld + Retail::OFFSET_CAMERAMANAGER_IN_WORLD);
             if (pCameraManager) {
                 void* targetDef = nullptr;
-
                 if (requestedState) {
                     if (g_CurrentActiveCameraDef == nullptr || g_CurrentActiveCameraDef == g_CameraDef_PCMain) targetDef = g_CameraDef_XboxMain;
                     else if (g_CurrentActiveCameraDef == g_CameraDef_PCCombat) targetDef = g_CameraDef_XboxCombat;
@@ -271,26 +413,39 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
             }
         }
 
-        // --- 3. Swap the Control Scheme ---
         if (g_XboxControlDef && g_PCControlDef) {
             void* pProfileManager = ((GetUserProfileManager_t)Retail::ADDR_USER_PROFILE_GET)();
             if (pProfileManager) {
                 void* xboxVector = (void*)((uintptr_t)g_XboxControlDef + 0x3C);
                 void* passiveVector = (void*)((uintptr_t)pProfileManager + 0x54);
-                void* aggressiveVector = (void*)((uintptr_t)pProfileManager + 0x60);
+                void* aggressiveVector = (void*)((uintptr_t)pProfileManager + 0x64);
+
+                bool* pTooltipEnabled = (bool*)((uintptr_t)pProfileManager + 0x19);
+                bool* pTooltipNew = (bool*)((uintptr_t)pProfileManager + 0xDD);
 
                 if (requestedState) {
-                    memcpy(g_PCPassiveBackup, passiveVector, 12);
-                    memcpy(g_PCAggressiveBackup, aggressiveVector, 12);
-                    memcpy(passiveVector, xboxVector, 12);
-                    memcpy(aggressiveVector, xboxVector, 12);
+                    // Control Scheme Swap
+                    memcpy(g_PCPassiveBackup, passiveVector, 16);
+                    memcpy(g_PCAggressiveBackup, aggressiveVector, 16);
+                    memcpy(passiveVector, xboxVector, 16);
+                    memcpy(aggressiveVector, xboxVector, 16);
+
+                    // Tooltip Override
+                    g_OriginalTooltipEnabled = *pTooltipEnabled;
+                    g_OriginalTooltipNew = *pTooltipNew;
+                    *pTooltipEnabled = false;
+                    *pTooltipNew = false;
 
                     ((ApplyValues_t)Retail::ADDR_APPLY_VALUES)(pProfileManager);
 
-                    memcpy(passiveVector, g_PCPassiveBackup, 12);
-                    memcpy(aggressiveVector, g_PCAggressiveBackup, 12);
+                    memcpy(passiveVector, g_PCPassiveBackup, 16);
+                    memcpy(aggressiveVector, g_PCAggressiveBackup, 16);
                 }
                 else {
+                    // Tooltip Restore
+                    *pTooltipEnabled = g_OriginalTooltipEnabled;
+                    *pTooltipNew = g_OriginalTooltipNew;
+
                     ((ApplyValues_t)Retail::ADDR_APPLY_VALUES)(pProfileManager);
                 }
             }
@@ -300,21 +455,15 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
     o_CPlayerGui_Update(_this, paused);
 }
 
+// =================================================================================
+// 5. THE DIRECTINPUT FILTER & MASKING
+// =================================================================================
 
-// =================================================================================
-// 3. THE DIRECTINPUT FILTER & MASKING
-// =================================================================================
 typedef HRESULT(WINAPI* tGetDeviceData)(IDirectInputDevice8W* _this, DWORD cbObjectData, LPDIDEVICEOBJECTDATA rgdod, LPDWORD pdwInOut, DWORD dwFlags);
 tGetDeviceData oGetDeviceData = nullptr;
 
 typedef HRESULT(WINAPI* tGetDeviceState)(IDirectInputDevice8W* _this, DWORD cbData, LPVOID lpvData);
 tGetDeviceState oGetDeviceState = nullptr;
-
-typedef HRESULT(WINAPI* tGetCapabilities)(IDirectInputDevice8W* _this, LPDIDEVCAPS lpDIDevCaps);
-tGetCapabilities oGetCapabilities = nullptr;
-
-typedef HRESULT(WINAPI* tEnumObjects)(IDirectInputDevice8W* _this, LPDIENUMDEVICEOBJECTSCALLBACKW lpCallback, LPVOID pvRef, DWORD dwFlags);
-tEnumObjects oEnumObjects = nullptr;
 
 DWORD TranslateStadiaButtonOffset(DWORD rawOffset) {
     switch (rawOffset) {
@@ -326,94 +475,37 @@ DWORD TranslateStadiaButtonOffset(DWORD rawOffset) {
     return rawOffset;
 }
 
-DWORD TranslateXboxDInputOffset(DWORD rawOffset) {
-    switch (rawOffset) {
-    case 0x30: return 0x33; case 0x31: return 0x34; case 0x32: return 0x30;
-    case 0x33: return 0x31; case 0x34: return 0x35; case 0x35: return 0x32;
-    case 0x36: return 0x3B; case 0x37: return 0x3A; case 0x38: return 0x38;
-    case 0x39: return 0x39;
+void TrackStadiaPOV(DWORD povValue) {
+    WORD oldMask = g_CurrentDPadMask;
+    g_CurrentDPadMask = 0;
+
+    if (LOWORD(povValue) != 0xFFFF) {
+        if (povValue == 0 || povValue == 31500 || povValue == 4500) g_CurrentDPadMask |= DPAD_MASK_UP;
+        if (povValue == 18000 || povValue == 13500 || povValue == 22500) g_CurrentDPadMask |= DPAD_MASK_DOWN;
+        if (povValue == 27000 || povValue == 22500 || povValue == 31500) g_CurrentDPadMask |= DPAD_MASK_LEFT;
+        if (povValue == 9000 || povValue == 4500 || povValue == 13500) g_CurrentDPadMask |= DPAD_MASK_RIGHT;
     }
-    return rawOffset;
 }
-
-// --- VTABLE [3] CAPABILITIES HOOK ---
-HRESULT WINAPI HookedGetCapabilities(IDirectInputDevice8W* _this, LPDIDEVCAPS lpDIDevCaps) {
-    HRESULT hr = oGetCapabilities(_this, lpDIDevCaps);
-    if (SUCCEEDED(hr) && _this != g_pMouse && _this != g_pKeyboard) {
-        // Force the engine to allocate enough memory to cover the Xbox Button Enums
-        if (lpDIDevCaps->dwButtons < 32) {
-            lpDIDevCaps->dwButtons = 32;
-        }
-    }
-    return hr;
-}
-
-// --- VTABLE [4] ENUM OBJECTS HOOK ---
-// Thread-local variables to safely intercept Fable's object enumeration callback
-thread_local LPDIENUMDEVICEOBJECTSCALLBACKW tl_OriginalCallback = nullptr;
-thread_local int tl_MaxButtonIndex = -1;
-
-BOOL CALLBACK InterceptedEnumCallback(LPCDIDEVICEOBJECTINSTANCEW lpddoi, LPVOID pvRef) {
-    if (lpddoi->guidType == GUID_Button) {
-        int btnIndex = DIDFT_GETINSTANCE(lpddoi->dwType);
-        if (btnIndex > tl_MaxButtonIndex) tl_MaxButtonIndex = btnIndex;
-    }
-    return tl_OriginalCallback(lpddoi, pvRef);
-}
-
-HRESULT WINAPI HookedEnumObjects(IDirectInputDevice8W* _this, LPDIENUMDEVICEOBJECTSCALLBACKW lpCallback, LPVOID pvRef, DWORD dwFlags) {
-    tl_OriginalCallback = lpCallback;
-    tl_MaxButtonIndex = -1;
-
-    HRESULT hr = oEnumObjects(_this, InterceptedEnumCallback, pvRef, dwFlags);
-
-    if (SUCCEEDED(hr) && _this != g_pMouse && _this != g_pKeyboard) {
-        // Synthesize any missing buttons past the hardware limit so Fable doesn't drop our emulated D-Pad events
-        for (int i = tl_MaxButtonIndex + 1; i < 32; i++) {
-            DIDEVICEOBJECTINSTANCEW doi = { 0 };
-            doi.dwSize = sizeof(DIDEVICEOBJECTINSTANCEW);
-            doi.guidType = GUID_Button;
-            doi.dwOfs = 0x30 + i; // DIJOFS_BUTTON(i)
-            doi.dwType = DIDFT_BUTTON | DIDFT_MAKEINSTANCE(i);
-            wcscpy_s(doi.tszName, L"Virtual Enum Button");
-
-            if (tl_OriginalCallback(&doi, pvRef) == DIENUM_STOP) break;
-        }
-    }
-    return hr;
-}
-
 
 HRESULT WINAPI HookedGetDeviceState(IDirectInputDevice8W* _this, DWORD cbData, LPVOID lpvData) {
     HRESULT hr = oGetDeviceState(_this, cbData, lpvData);
 
     if (_this != nullptr && _this != g_pMouse && _this != g_pKeyboard) {
-        XINPUT_STATE xState;
-        if (XInputGetState(0, &xState) == ERROR_SUCCESS) {
-            if (xState.Gamepad.wButtons != 0 ||
-                abs(xState.Gamepad.sThumbLX) > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE ||
-                abs(xState.Gamepad.sThumbLY) > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE ||
-                abs(xState.Gamepad.sThumbRX) > XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE ||
-                abs(xState.Gamepad.sThumbRY) > XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE)
-            {
-                g_IsControllerActive = true;
-            }
-        }
-        else if (SUCCEEDED(hr) && cbData == sizeof(DIJOYSTATE)) {
+        if (SUCCEEDED(hr) && cbData == sizeof(DIJOYSTATE)) {
             DIJOYSTATE* js = (DIJOYSTATE*)lpvData;
+
+            TrackStadiaPOV(js->rgdwPOV[0]);
+
+            g_RightTriggerHeld = (js->lZ < -100) || (js->rgbButtons[7] & 0x80) || (js->rgbButtons[8] & 0x80);
+
             for (int i = 0; i < 32; i++) { if (js->rgbButtons[i] & 0x80) g_IsControllerActive = true; }
             for (int i = 0; i < 4; i++) { if (js->rgdwPOV[i] != -1 && js->rgdwPOV[i] != 65535) g_IsControllerActive = true; }
 
-            // POV Hat to Button Emulation
-            DWORD pov = js->rgdwPOV[0];
-            if (LOWORD(pov) != 0xFFFF) {
-                if (pov >= 31500 || pov <= 4500)  js->rgbButtons[13] = 0x80; // 0x3D (UP)
-                else if (pov >= 4500 && pov <= 13500) js->rgbButtons[16] = 0x80; // 0x40 (RIGHT)
-                else if (pov >= 13500 && pov <= 22500) js->rgbButtons[14] = 0x80; // 0x3E (DOWN)
-                else if (pov >= 22500 && pov <= 31500) js->rgbButtons[15] = 0x80; // 0x3F (LEFT)
+            if (!g_InjectedThisFrame) {
+                ProcessDPadInjection();
+                g_InjectedThisFrame = true;
             }
         }
-
         if (!g_IsControllerActive) return DIERR_NOTACQUIRED;
     }
     return hr;
@@ -447,56 +539,23 @@ HRESULT WINAPI HookedGetDeviceData(IDirectInputDevice8W* _this, DWORD cbObjectDa
 
     if (!g_IsControllerActive) g_IsControllerActive = true;
 
-    XINPUT_STATE xState;
-    bool isXInput = (XInputGetState(0, &xState) == ERROR_SUCCESS);
-
     for (DWORD i = 0; i < *pdwInOut; i++) {
         DWORD originalOffset = rgdod[i].dwOfs;
-
-        // 1. Standard Button Translation
         if (originalOffset >= 0x30 && originalOffset <= 0x3F) {
-            rgdod[i].dwOfs = isXInput ? TranslateXboxDInputOffset(originalOffset) : TranslateStadiaButtonOffset(originalOffset);
+            rgdod[i].dwOfs = TranslateStadiaButtonOffset(originalOffset);
         }
-
-        // 2. POV Hat to Engine Enum Translation
-        else if (originalOffset == 0x20 /* DIJOFS_POV(0) */) {
-            int povValue = (int)rgdod[i].dwData;
-
-            constexpr DWORD FABLE_DPAD_UP = 0x3D;
-            constexpr DWORD FABLE_DPAD_DOWN = 0x3E;
-            constexpr DWORD FABLE_DPAD_LEFT = 0x3F;
-            constexpr DWORD FABLE_DPAD_RIGHT = 0x40;
-
-            if (LOWORD(povValue) == 0xFFFF) {
-                if (g_LastDpadButtonOffset != 0) {
-                    rgdod[i].dwOfs = g_LastDpadButtonOffset;
-                    rgdod[i].dwData = 0x00;
-                    g_LastDpadButtonOffset = 0;
-                }
-                else {
-                    rgdod[i].dwOfs = 0;
-                    rgdod[i].dwData = 0;
-                }
-            }
-            else {
-                DWORD targetOffset = 0;
-
-                if (povValue >= 31500 || povValue <= 4500)  targetOffset = FABLE_DPAD_UP;
-                else if (povValue >= 4500 && povValue <= 13500) targetOffset = FABLE_DPAD_RIGHT;
-                else if (povValue >= 13500 && povValue <= 22500) targetOffset = FABLE_DPAD_DOWN;
-                else if (povValue >= 22500 && povValue <= 31500) targetOffset = FABLE_DPAD_LEFT;
-
-                if (targetOffset != 0) {
-                    rgdod[i].dwOfs = targetOffset;
-                    rgdod[i].dwData = 0x80;
-                    g_LastDpadButtonOffset = targetOffset;
-                }
-            }
+        else if (originalOffset == DIJOFS_POV(0)) {
+            TrackStadiaPOV(rgdod[i].dwData);
+        }
+        else if (originalOffset == DIJOFS_Z) {
+            g_RightTriggerHeld = ((int)rgdod[i].dwData < -100);
+        }
+        else if (originalOffset == DIJOFS_BUTTON(7) || originalOffset == DIJOFS_BUTTON(8)) {
+            g_RightTriggerHeld = ((rgdod[i].dwData & 0x80) != 0);
         }
     }
     return hr;
 }
-
 
 typedef HRESULT(WINAPI* tDirectInput8Create)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
 tDirectInput8Create oDirectInput8Create = nullptr;
@@ -507,23 +566,11 @@ tCreateDevice oCreateDevice = nullptr;
 HRESULT WINAPI HookedCreateDevice(IDirectInput8W* _this, REFGUID rguid, LPDIRECTINPUTDEVICE8W* lplpDirectInputDevice, LPUNKNOWN punkOuter) {
     HRESULT hr = oCreateDevice(_this, rguid, lplpDirectInputDevice, punkOuter);
     if (SUCCEEDED(hr) && lplpDirectInputDevice != nullptr && *lplpDirectInputDevice != nullptr) {
-
         if (rguid == GUID_SysMouse) g_pMouse = *lplpDirectInputDevice;
         else if (rguid == GUID_SysKeyboard) g_pKeyboard = *lplpDirectInputDevice;
 
         void** vTable = *(void***)(*lplpDirectInputDevice);
 
-        // Install Capabilities Hooks to bypass 10-button limit
-        if (oGetCapabilities == nullptr) {
-            MH_CreateHook(vTable[3], &HookedGetCapabilities, (LPVOID*)&oGetCapabilities);
-            MH_EnableHook(vTable[3]);
-        }
-        if (oEnumObjects == nullptr) {
-            MH_CreateHook(vTable[4], &HookedEnumObjects, (LPVOID*)&oEnumObjects);
-            MH_EnableHook(vTable[4]);
-        }
-
-        // Install Data Hooks
         if (oGetDeviceState == nullptr) {
             MH_CreateHook(vTable[9], &HookedGetDeviceState, (LPVOID*)&oGetDeviceState);
             MH_EnableHook(vTable[9]);
@@ -549,9 +596,13 @@ HRESULT WINAPI HookedDirectInput8Create(HINSTANCE hinst, DWORD dwVersion, REFIID
 }
 
 // =================================================================================
-// 4. DEPLOYMENT & MAIN THREAD
+// 6. DEPLOYMENT & MAIN THREAD
 // =================================================================================
+
 void InjectGUIHotswapHooks() {
+    if (MH_CreateHook((LPVOID)Retail::ADDR_CINPUTMANAGER_UPDATE, &Hooked_CInputManager_Update, (LPVOID*)&o_CInputManager_Update) == MH_OK) {
+        MH_EnableHook((LPVOID)Retail::ADDR_CINPUTMANAGER_UPDATE);
+    }
     if (MH_CreateHook((LPVOID)Retail::ADDR_CPLAYERGUI_UPDATE, &Hooked_CPlayerGui_Update, (LPVOID*)&o_CPlayerGui_Update) == MH_OK) {
         MH_EnableHook((LPVOID)Retail::ADDR_CPLAYERGUI_UPDATE);
     }
@@ -561,7 +612,15 @@ void InjectGUIHotswapHooks() {
     if (MH_CreateHook((LPVOID)Retail::ADDR_SET_CAMERA_MANAGER_DEF, &Hooked_SetCameraManagerDef, (LPVOID*)&o_SetCameraManagerDef) == MH_OK) {
         MH_EnableHook((LPVOID)Retail::ADDR_SET_CAMERA_MANAGER_DEF);
     }
-
+    if (MH_CreateHook((LPVOID)Retail::ADDR_IS_QUICK_ACCESS, &Hooked_IsQuickAccess, (LPVOID*)&o_IsQuickAccess) == MH_OK) {
+        MH_EnableHook((LPVOID)Retail::ADDR_IS_QUICK_ACCESS);
+    }
+    if (MH_CreateHook((LPVOID)Retail::ADDR_IS_CONTEXT_SENSITIVE, &Hooked_IsContextSensitive, (LPVOID*)&o_IsContextSensitive) == MH_OK) {
+        MH_EnableHook((LPVOID)Retail::ADDR_IS_CONTEXT_SENSITIVE);
+    }
+    if (MH_CreateHook((LPVOID)Retail::ADDR_DRAW_ICON, &Hooked_DrawIcon, (LPVOID*)&o_DrawIcon) == MH_OK) {
+        MH_EnableHook((LPVOID)Retail::ADDR_DRAW_ICON);
+    }
     if (Retail::ADDR_ISTOGGLE_ZTARGET != 0x0) {
         if (MH_CreateHook((LPVOID)Retail::ADDR_ISTOGGLE_ZTARGET, &Hooked_IsToggleZTarget, (LPVOID*)&o_IsToggleZTarget) == MH_OK) {
             MH_EnableHook((LPVOID)Retail::ADDR_ISTOGGLE_ZTARGET);
