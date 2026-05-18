@@ -34,7 +34,7 @@ namespace Retail {
     constexpr ptrdiff_t OFFSET_PDRAW_QUICK_ACCESS = 0x1D8;
     constexpr ptrdiff_t OFFSET_PDRAW_ABILITY_BUTTONS = 0x200;
     constexpr ptrdiff_t OFFSET_ILLUSTRATORS = 0x2C0;
-    constexpr ptrdiff_t OFFSET_SHOW_SPECIAL_BUTTONS = 0x250; // The Native Spell Mode Boolean
+    constexpr ptrdiff_t OFFSET_SHOW_SPECIAL_BUTTONS = 0x250;
 
     constexpr uintptr_t ADDR_PGUIDEF_GLOBAL = 0x013B878C;
     constexpr uintptr_t ADDR_CPLAYERGUI_UPDATE = 0x0043A080;
@@ -55,14 +55,18 @@ namespace Retail {
     constexpr uintptr_t ADDR_ISTOGGLE_SNEAK = 0x00000000;
     constexpr uintptr_t ADDR_ISTOGGLE_SPELLS = 0x00000000;
 
-    // Visual UI Pollers
     constexpr uintptr_t ADDR_IS_QUICK_ACCESS = 0x004460C0;
     constexpr uintptr_t ADDR_IS_CONTEXT_SENSITIVE = 0x004461D0;
     constexpr uintptr_t ADDR_DRAW_ICON = 0x00645292;
 
-    // Core Action Logic Evaluators
     constexpr uintptr_t ADDR_IS_EVENT_QA = 0x00446000;
     constexpr uintptr_t ADDR_IS_EVENT_CS = 0x00446110;
+
+    // Exact byte address of the '02' in the 'cmp eax, 02' instruction for CTCBetting (Temples/General)
+    constexpr uintptr_t ADDR_BETTING_EVENT_CHECK = 0x007E52EE;
+
+    // Exact byte address of the '02' in the 'cmp eax, 02' instruction for CTCTavernGame (Minigames)
+    constexpr uintptr_t ADDR_TAVERN_BETTING_EVENT_CHECK = 0x005EC3C6;
 }
 
 // --- Global State ---
@@ -70,18 +74,33 @@ bool g_IsControllerActive = false;
 bool g_LastControllerState = false;
 bool g_ShadowObjectsInitialized = false;
 
-// We capture the GUI instance so our hooks can read the native Spell Mode boolean
 void* g_pPlayerGui = nullptr;
-
-// Crossfade UI State
 float g_CrossfadeAlpha = 0.0f;
 double g_LastFrameTime = 0.0;
 
-// Tooltip Backups
 bool g_OriginalTooltipEnabled = true;
 bool g_OriginalTooltipNew = true;
 
-// --- DirectInput & Vector Injection State ---
+// =================================================================================
+// 1. ENGINE MEMORY STRUCTURES
+// =================================================================================
+#pragma pack(push, 1)
+struct EngineInputEvent {
+    uint8_t  Pad0[8];
+    uint8_t  JoystickButton;
+    uint8_t  Pad1[3];
+    float    JoystickPressure;
+    uint8_t  Pad2[8];
+    float    MousePosX;
+    float    MousePosY;
+    uint32_t DeviceType;
+    uint32_t DeviceNumber;
+    uint32_t EventType;
+    float    CurrentTime;
+    float    StartTime;
+};
+#pragma pack(pop)
+
 #define DPAD_MASK_UP    0x0001
 #define DPAD_MASK_DOWN  0x0002
 #define DPAD_MASK_LEFT  0x0004
@@ -143,33 +162,11 @@ IsEventInQueue_t o_IsQuickAccess = nullptr;
 typedef void(__thiscall* DrawIcon_t)(void* _this, void* info, void* tlpos, float alpha, int primitive_index, int back_graphic, int icon_graphic, bool special);
 DrawIcon_t o_DrawIcon = nullptr;
 
-// NEW Typedefs: Core Logic Evaluators
 typedef char(__thiscall* IsEventQA_t)(void* _this, const void* event, int* item_index);
 IsEventQA_t o_IsEventQA = nullptr;
 
 typedef char(__thiscall* IsEventCS_t)(void* _this, const void* event, int* item_index);
 IsEventCS_t o_IsEventCS = nullptr;
-
-
-// =================================================================================
-// 1. ENGINE MEMORY STRUCTURES
-// =================================================================================
-#pragma pack(push, 1)
-struct EngineInputEvent {
-    uint8_t  Pad0[8];
-    uint8_t  JoystickButton;
-    uint8_t  Pad1[3];
-    float    JoystickPressure;
-    uint8_t  Pad2[8];
-    float    MousePosX;
-    float    MousePosY;
-    uint32_t DeviceType;
-    uint32_t DeviceNumber;
-    uint32_t EventType;
-    float    CurrentTime;
-    float    StartTime;
-};
-#pragma pack(pop)
 
 // =================================================================================
 // 2. THE D-PAD VECTOR INJECTOR
@@ -241,15 +238,10 @@ void __fastcall Hooked_CInputManager_Update(void* _this, void* edx) {
 // 3. THE DEFINITION, UI, & LOGIC INTERCEPTORS 
 // =================================================================================
 
-// NEW LOGIC HOOKS: Hard filters to manage the overlapping bindings
 char __fastcall Hooked_IsEventQA(void* _this, void* edx, const void* event, int* item_index) {
     if (g_IsControllerActive && g_pPlayerGui) {
         bool showSpecial = *(bool*)((uintptr_t)g_pPlayerGui + Retail::OFFSET_SHOW_SPECIAL_BUTTONS);
-
-        // If RT is OFF, force the engine to ignore Quick Access evaluation
-        if (!showSpecial) {
-            return 0;
-        }
+        if (!showSpecial) { return 0; }
     }
     return o_IsEventQA(_this, event, item_index);
 }
@@ -257,25 +249,16 @@ char __fastcall Hooked_IsEventQA(void* _this, void* edx, const void* event, int*
 char __fastcall Hooked_IsEventCS(void* _this, void* edx, const void* event, int* item_index) {
     if (g_IsControllerActive && g_pPlayerGui) {
         bool showSpecial = *(bool*)((uintptr_t)g_pPlayerGui + Retail::OFFSET_SHOW_SPECIAL_BUTTONS);
-
-        // If RT is ON, force the engine to ignore Contextual evaluation
-        if (showSpecial) {
-            return 0;
-        }
+        if (showSpecial) { return 0; }
     }
     return o_IsEventCS(_this, event, item_index);
 }
 
-// UI Pollers (Kept for visual toggling)
 bool __fastcall Hooked_IsContextSensitive(void* _this, void* edx, float item_index, int event_type, int device_number) {
     if (g_IsControllerActive && g_pPlayerGui) {
         bool showSpecial = *(bool*)((uintptr_t)g_pPlayerGui + Retail::OFFSET_SHOW_SPECIAL_BUTTONS);
         int index = (int)item_index;
-
-        if (showSpecial) {
-            // Spell Mode ON: Mute Contextual Visuals
-            if (index >= 0 && index <= 3) return false;
-        }
+        if (showSpecial) { if (index >= 0 && index <= 3) return false; }
     }
     return o_IsContextSensitive(_this, item_index, event_type, device_number);
 }
@@ -284,24 +267,15 @@ bool __fastcall Hooked_IsQuickAccess(void* _this, void* edx, float item_index, i
     if (g_IsControllerActive && g_pPlayerGui) {
         bool showSpecial = *(bool*)((uintptr_t)g_pPlayerGui + Retail::OFFSET_SHOW_SPECIAL_BUTTONS);
         int index = (int)item_index;
-
-        if (!showSpecial) {
-            // Spell Mode OFF: Mute Quick Access Visuals
-            if (index >= 0 && index <= 3) return false;
-        }
+        if (!showSpecial) { if (index >= 0 && index <= 3) return false; }
     }
     return o_IsQuickAccess(_this, item_index, event_type, device_number);
 }
 
 void __fastcall Hooked_DrawIcon(void* _this, void* edx, void* info, void* tlpos, float alpha, int primitive_index, int back_graphic, int icon_graphic, bool special) {
     if (g_IsControllerActive && g_pPlayerGui) {
-        // Apply our custom crossfade float to smoothly transition icons
-        if (special) {
-            alpha = g_CrossfadeAlpha;          // Quick Access fades IN
-        }
-        else {
-            alpha = 1.0f - g_CrossfadeAlpha;   // Contextual fades OUT
-        }
+        if (special) { alpha = g_CrossfadeAlpha; }
+        else { alpha = 1.0f - g_CrossfadeAlpha; }
     }
     o_DrawIcon(_this, info, tlpos, alpha, primitive_index, back_graphic, icon_graphic, special);
 }
@@ -357,7 +331,6 @@ void __fastcall Hooked_SetCameraManagerDef(void* _this, void* edx, void** new_de
 
 void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
 
-    // Capture the pointer globally so our visual/input hooks can read native states
     g_pPlayerGui = _this;
 
     static void* g_LastPlayerGuiInstance = nullptr;
@@ -369,7 +342,7 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
         g_PCQuickAccessIcons = nullptr;
         g_CurrentActiveCameraDef = nullptr;
         g_LastControllerState = false;
-        g_CrossfadeAlpha = 0.0f; // Reset fader on new session
+        g_CrossfadeAlpha = 0.0f;
     }
 
     if (!g_ShadowObjectsInitialized) {
@@ -427,6 +400,29 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
 
         void** currentAbilityPtr = (void**)((uintptr_t)_this + Retail::OFFSET_PDRAW_ABILITY_BUTTONS);
         void** currentQuickAccessPtr = (void**)((uintptr_t)_this + Retail::OFFSET_PDRAW_QUICK_ACCESS);
+
+        // =========================================================================
+        // DYNAMIC BETTING PATCH
+        // Swaps the 'cmp eax, 0x02' in CTCBetting & CTCTavernGame 
+        // to 'cmp eax, 0x11' when active.
+        // =========================================================================
+        DWORD oldProtect1, oldProtect2;
+        if (VirtualProtect((LPVOID)Retail::ADDR_BETTING_EVENT_CHECK, 1, PAGE_EXECUTE_READWRITE, &oldProtect1) &&
+            VirtualProtect((LPVOID)Retail::ADDR_TAVERN_BETTING_EVENT_CHECK, 1, PAGE_EXECUTE_READWRITE, &oldProtect2)) {
+
+            if (requestedState) {
+                *(uint8_t*)Retail::ADDR_BETTING_EVENT_CHECK = 0x11; // IE_JOYSTICK_POSITION
+                *(uint8_t*)Retail::ADDR_TAVERN_BETTING_EVENT_CHECK = 0x11;
+                Log("Betting UI updated to Controller Mode (0x11)");
+            }
+            else {
+                *(uint8_t*)Retail::ADDR_BETTING_EVENT_CHECK = 0x02; // IE_KEY_HELD
+                *(uint8_t*)Retail::ADDR_TAVERN_BETTING_EVENT_CHECK = 0x02;
+                Log("Betting UI reverted to PC Mode (0x02)");
+            }
+            VirtualProtect((LPVOID)Retail::ADDR_BETTING_EVENT_CHECK, 1, oldProtect1, &oldProtect1);
+            VirtualProtect((LPVOID)Retail::ADDR_TAVERN_BETTING_EVENT_CHECK, 1, oldProtect2, &oldProtect2);
+        }
 
         if (requestedState) {
             if (!g_PCAbilityButtons) g_PCAbilityButtons = *currentAbilityPtr;
@@ -497,7 +493,6 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
         }
     }
 
-    // --- CUSTOM UI CROSSFADER ---
     double currentTime = GFGetTime();
     float deltaTime = (float)(currentTime - g_LastFrameTime);
     g_LastFrameTime = currentTime;
@@ -506,7 +501,6 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
 
     bool showSpecial = *(bool*)((uintptr_t)_this + Retail::OFFSET_SHOW_SPECIAL_BUTTONS);
 
-    // INCREASED FADE SPEED (80% faster than 5.0f)
     float fadeSpeed = 9.0f;
 
     if (showSpecial) {
@@ -517,7 +511,6 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
         g_CrossfadeAlpha -= deltaTime * fadeSpeed;
         if (g_CrossfadeAlpha < 0.0f) g_CrossfadeAlpha = 0.0f;
     }
-    // ----------------------------
 
     o_CPlayerGui_Update(_this, paused);
 }
@@ -668,14 +661,12 @@ void InjectGUIHotswapHooks() {
     if (MH_CreateHook((LPVOID)Retail::ADDR_SET_CAMERA_MANAGER_DEF, &Hooked_SetCameraManagerDef, (LPVOID*)&o_SetCameraManagerDef) == MH_OK) {
         MH_EnableHook((LPVOID)Retail::ADDR_SET_CAMERA_MANAGER_DEF);
     }
-    // Re-enabled your UI hooks
     if (MH_CreateHook((LPVOID)Retail::ADDR_IS_QUICK_ACCESS, &Hooked_IsQuickAccess, (LPVOID*)&o_IsQuickAccess) == MH_OK) {
         MH_EnableHook((LPVOID)Retail::ADDR_IS_QUICK_ACCESS);
     }
     if (MH_CreateHook((LPVOID)Retail::ADDR_IS_CONTEXT_SENSITIVE, &Hooked_IsContextSensitive, (LPVOID*)&o_IsContextSensitive) == MH_OK) {
         MH_EnableHook((LPVOID)Retail::ADDR_IS_CONTEXT_SENSITIVE);
     }
-    // Added the new core logic hooks!
     if (MH_CreateHook((LPVOID)Retail::ADDR_IS_EVENT_QA, &Hooked_IsEventQA, (LPVOID*)&o_IsEventQA) == MH_OK) {
         MH_EnableHook((LPVOID)Retail::ADDR_IS_EVENT_QA);
     }
@@ -685,6 +676,7 @@ void InjectGUIHotswapHooks() {
     if (MH_CreateHook((LPVOID)Retail::ADDR_DRAW_ICON, &Hooked_DrawIcon, (LPVOID*)&o_DrawIcon) == MH_OK) {
         MH_EnableHook((LPVOID)Retail::ADDR_DRAW_ICON);
     }
+
     if (Retail::ADDR_ISTOGGLE_ZTARGET != 0x0) {
         if (MH_CreateHook((LPVOID)Retail::ADDR_ISTOGGLE_ZTARGET, &Hooked_IsToggleZTarget, (LPVOID*)&o_IsToggleZTarget) == MH_OK) {
             MH_EnableHook((LPVOID)Retail::ADDR_ISTOGGLE_ZTARGET);
