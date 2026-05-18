@@ -34,6 +34,7 @@ namespace Retail {
     constexpr ptrdiff_t OFFSET_PDRAW_QUICK_ACCESS = 0x1D8;
     constexpr ptrdiff_t OFFSET_PDRAW_ABILITY_BUTTONS = 0x200;
     constexpr ptrdiff_t OFFSET_ILLUSTRATORS = 0x2C0;
+    constexpr ptrdiff_t OFFSET_SHOW_SPECIAL_BUTTONS = 0x250; // The Native Spell Mode Boolean
 
     constexpr uintptr_t ADDR_PGUIDEF_GLOBAL = 0x013B878C;
     constexpr uintptr_t ADDR_CPLAYERGUI_UPDATE = 0x0043A080;
@@ -41,7 +42,6 @@ namespace Retail {
     constexpr uintptr_t ADDR_CONSTRUCT_XBOX_QUICKACCESS = 0x00652F0A;
     constexpr uintptr_t ADDR_CCHARSTRING_CONSTRUCT = 0x0099EBF0;
 
-    // Core Engine Input Vectors
     constexpr uintptr_t ADDR_CINPUTMANAGER_UPDATE = 0x009F57A0;
     constexpr uintptr_t ADDR_GFGETTIME = 0x009E1BC0;
 
@@ -55,16 +55,27 @@ namespace Retail {
     constexpr uintptr_t ADDR_ISTOGGLE_SNEAK = 0x00000000;
     constexpr uintptr_t ADDR_ISTOGGLE_SPELLS = 0x00000000;
 
-    // Quick Access & Contextual UI Logic Hooks
+    // Visual UI Pollers
     constexpr uintptr_t ADDR_IS_QUICK_ACCESS = 0x004460C0;
     constexpr uintptr_t ADDR_IS_CONTEXT_SENSITIVE = 0x004461D0;
     constexpr uintptr_t ADDR_DRAW_ICON = 0x00645292;
+
+    // Core Action Logic Evaluators
+    constexpr uintptr_t ADDR_IS_EVENT_QA = 0x00446000;
+    constexpr uintptr_t ADDR_IS_EVENT_CS = 0x00446110;
 }
 
-// --- Hotswap Global State ---
+// --- Global State ---
 bool g_IsControllerActive = false;
 bool g_LastControllerState = false;
 bool g_ShadowObjectsInitialized = false;
+
+// We capture the GUI instance so our hooks can read the native Spell Mode boolean
+void* g_pPlayerGui = nullptr;
+
+// Crossfade UI State
+float g_CrossfadeAlpha = 0.0f;
+double g_LastFrameTime = 0.0;
 
 // Tooltip Backups
 bool g_OriginalTooltipEnabled = true;
@@ -78,8 +89,6 @@ bool g_OriginalTooltipNew = true;
 
 WORD g_CurrentDPadMask = 0;
 WORD g_LastDPadMask = 0;
-bool g_RightTriggerHeld = false;
-
 void* g_pInputManager = nullptr;
 bool g_InjectedThisFrame = false;
 
@@ -99,9 +108,6 @@ void* g_XboxControlDef = nullptr;
 
 char g_PCPassiveBackup[16];
 char g_PCAggressiveBackup[16];
-
-IDirectInputDevice8W* g_pMouse = nullptr;
-IDirectInputDevice8W* g_pKeyboard = nullptr;
 
 // --- Function Typedefs ---
 typedef void(__thiscall* CPlayerGui_Update_t)(void* _this, bool paused);
@@ -130,17 +136,24 @@ IsToggle_t o_IsToggleZTarget = nullptr;
 IsToggle_t o_IsToggleSneak = nullptr;
 IsToggle_t o_IsToggleSpells = nullptr;
 
-typedef bool(__thiscall* IsEventInQueue_t)(void* _this, long item_index, int event_type, int device_number);
+typedef bool(__thiscall* IsEventInQueue_t)(void* _this, float item_index, int event_type, int device_number);
 IsEventInQueue_t o_IsContextSensitive = nullptr;
 IsEventInQueue_t o_IsQuickAccess = nullptr;
 
 typedef void(__thiscall* DrawIcon_t)(void* _this, void* info, void* tlpos, float alpha, int primitive_index, int back_graphic, int icon_graphic, bool special);
 DrawIcon_t o_DrawIcon = nullptr;
 
+// NEW Typedefs: Core Logic Evaluators
+typedef char(__thiscall* IsEventQA_t)(void* _this, const void* event, int* item_index);
+IsEventQA_t o_IsEventQA = nullptr;
+
+typedef char(__thiscall* IsEventCS_t)(void* _this, const void* event, int* item_index);
+IsEventCS_t o_IsEventCS = nullptr;
+
+
 // =================================================================================
 // 1. ENGINE MEMORY STRUCTURES
 // =================================================================================
-
 #pragma pack(push, 1)
 struct EngineInputEvent {
     uint8_t  Pad0[8];
@@ -155,13 +168,12 @@ struct EngineInputEvent {
     uint32_t EventType;
     float    CurrentTime;
     float    StartTime;
-}; // Exactly 52 Bytes (0x34)
+};
 #pragma pack(pop)
 
 // =================================================================================
 // 2. THE D-PAD VECTOR INJECTOR
 // =================================================================================
-
 void PushEventToVector(void* pInputManager, uint8_t buttonId, uint32_t eventType, uint32_t deviceNum) {
     EngineInputEvent** _Myfirst = (EngineInputEvent**)((uintptr_t)pInputManager + 0x10);
     EngineInputEvent** _Mylast = (EngineInputEvent**)((uintptr_t)pInputManager + 0x14);
@@ -181,7 +193,6 @@ void PushEventToVector(void* pInputManager, uint8_t buttonId, uint32_t eventType
     newEvent->DeviceType = 1;
     newEvent->DeviceNumber = deviceNum;
     newEvent->EventType = eventType;
-
     newEvent->CurrentTime = engineTime;
     newEvent->StartTime = engineTime;
 
@@ -192,15 +203,14 @@ void PushEventToVector(void* pInputManager, uint8_t buttonId, uint32_t eventType
 void ProcessDPadInjection() {
     if (!g_pInputManager || !g_IsControllerActive) return;
 
-    auto EvaluateAndInject = [&](WORD mask, uint8_t btnId, const char* name) {
+    auto EvaluateAndInject = [&](WORD mask, uint8_t btnId) {
         bool isHeld = (g_CurrentDPadMask & mask) != 0;
         bool wasHeld = (g_LastDPadMask & mask) != 0;
-
         uint32_t eventType = 0;
 
-        if (isHeld && !wasHeld) { eventType = 19; }
-        else if (isHeld && wasHeld) { eventType = 20; }
-        else if (!isHeld && wasHeld) { eventType = 21; }
+        if (isHeld && !wasHeld) eventType = 19;
+        else if (isHeld && wasHeld) eventType = 20;
+        else if (!isHeld && wasHeld) eventType = 21;
 
         if (eventType != 0) {
             PushEventToVector(g_pInputManager, btnId, eventType, 0);
@@ -209,10 +219,10 @@ void ProcessDPadInjection() {
         }
         };
 
-    EvaluateAndInject(DPAD_MASK_UP, 13, "UP");
-    EvaluateAndInject(DPAD_MASK_DOWN, 14, "DOWN");
-    EvaluateAndInject(DPAD_MASK_LEFT, 15, "LEFT");
-    EvaluateAndInject(DPAD_MASK_RIGHT, 16, "RIGHT");
+    EvaluateAndInject(DPAD_MASK_UP, 13);
+    EvaluateAndInject(DPAD_MASK_DOWN, 14);
+    EvaluateAndInject(DPAD_MASK_LEFT, 15);
+    EvaluateAndInject(DPAD_MASK_RIGHT, 16);
 }
 
 void __fastcall Hooked_CInputManager_Update(void* _this, void* edx) {
@@ -231,30 +241,66 @@ void __fastcall Hooked_CInputManager_Update(void* _this, void* edx) {
 // 3. THE DEFINITION, UI, & LOGIC INTERCEPTORS 
 // =================================================================================
 
-bool __fastcall Hooked_IsContextSensitive(void* _this, void* edx, long item_index, int event_type, int device_number) {
-    if (g_IsControllerActive && g_RightTriggerHeld) {
-        return false;
+// NEW LOGIC HOOKS: Hard filters to manage the overlapping bindings
+char __fastcall Hooked_IsEventQA(void* _this, void* edx, const void* event, int* item_index) {
+    if (g_IsControllerActive && g_pPlayerGui) {
+        bool showSpecial = *(bool*)((uintptr_t)g_pPlayerGui + Retail::OFFSET_SHOW_SPECIAL_BUTTONS);
+
+        // If RT is OFF, force the engine to ignore Quick Access evaluation
+        if (!showSpecial) {
+            return 0;
+        }
+    }
+    return o_IsEventQA(_this, event, item_index);
+}
+
+char __fastcall Hooked_IsEventCS(void* _this, void* edx, const void* event, int* item_index) {
+    if (g_IsControllerActive && g_pPlayerGui) {
+        bool showSpecial = *(bool*)((uintptr_t)g_pPlayerGui + Retail::OFFSET_SHOW_SPECIAL_BUTTONS);
+
+        // If RT is ON, force the engine to ignore Contextual evaluation
+        if (showSpecial) {
+            return 0;
+        }
+    }
+    return o_IsEventCS(_this, event, item_index);
+}
+
+// UI Pollers (Kept for visual toggling)
+bool __fastcall Hooked_IsContextSensitive(void* _this, void* edx, float item_index, int event_type, int device_number) {
+    if (g_IsControllerActive && g_pPlayerGui) {
+        bool showSpecial = *(bool*)((uintptr_t)g_pPlayerGui + Retail::OFFSET_SHOW_SPECIAL_BUTTONS);
+        int index = (int)item_index;
+
+        if (showSpecial) {
+            // Spell Mode ON: Mute Contextual Visuals
+            if (index >= 0 && index <= 3) return false;
+        }
     }
     return o_IsContextSensitive(_this, item_index, event_type, device_number);
 }
 
-bool __fastcall Hooked_IsQuickAccess(void* _this, void* edx, long item_index, int event_type, int device_number) {
-    if (g_IsControllerActive && g_RightTriggerHeld) {
-        if (item_index == 0) return (g_CurrentDPadMask & DPAD_MASK_UP) != 0;
-        if (item_index == 1) return (g_CurrentDPadMask & DPAD_MASK_DOWN) != 0;
-        if (item_index == 2) return (g_CurrentDPadMask & DPAD_MASK_LEFT) != 0;
-        if (item_index == 3) return (g_CurrentDPadMask & DPAD_MASK_RIGHT) != 0;
+bool __fastcall Hooked_IsQuickAccess(void* _this, void* edx, float item_index, int event_type, int device_number) {
+    if (g_IsControllerActive && g_pPlayerGui) {
+        bool showSpecial = *(bool*)((uintptr_t)g_pPlayerGui + Retail::OFFSET_SHOW_SPECIAL_BUTTONS);
+        int index = (int)item_index;
+
+        if (!showSpecial) {
+            // Spell Mode OFF: Mute Quick Access Visuals
+            if (index >= 0 && index <= 3) return false;
+        }
     }
     return o_IsQuickAccess(_this, item_index, event_type, device_number);
 }
 
 void __fastcall Hooked_DrawIcon(void* _this, void* edx, void* info, void* tlpos, float alpha, int primitive_index, int back_graphic, int icon_graphic, bool special) {
-    if (g_IsControllerActive) {
-        if (g_RightTriggerHeld) {
-            alpha = special ? 1.0f : 0.0f;
+    if (g_IsControllerActive && g_pPlayerGui) {
+        // Apply our custom crossfade float to smoothly transition icons
+        if (special) {
+            alpha = g_CrossfadeAlpha;          // Quick Access fades IN
         }
         else {
-            alpha = special ? 0.0f : 1.0f;
+            alpha = 1.0f - g_CrossfadeAlpha;   // Contextual fades OUT
         }
     }
     o_DrawIcon(_this, info, tlpos, alpha, primitive_index, back_graphic, icon_graphic, special);
@@ -311,6 +357,9 @@ void __fastcall Hooked_SetCameraManagerDef(void* _this, void* edx, void** new_de
 
 void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
 
+    // Capture the pointer globally so our visual/input hooks can read native states
+    g_pPlayerGui = _this;
+
     static void* g_LastPlayerGuiInstance = nullptr;
     if (g_LastPlayerGuiInstance != _this) {
         Log("New Session Detected. Resetting Caches.");
@@ -320,11 +369,11 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
         g_PCQuickAccessIcons = nullptr;
         g_CurrentActiveCameraDef = nullptr;
         g_LastControllerState = false;
+        g_CrossfadeAlpha = 0.0f; // Reset fader on new session
     }
 
     if (!g_ShadowObjectsInitialized) {
         void* illustrators = (void*)((uintptr_t)_this + Retail::OFFSET_ILLUSTRATORS);
-
         memset(g_XboxAbilityBuffer, 0, sizeof(g_XboxAbilityBuffer));
         memset(g_XboxQuickAccessBuffer, 0, sizeof(g_XboxQuickAccessBuffer));
 
@@ -424,13 +473,11 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
                 bool* pTooltipNew = (bool*)((uintptr_t)pProfileManager + 0xDD);
 
                 if (requestedState) {
-                    // Control Scheme Swap
                     memcpy(g_PCPassiveBackup, passiveVector, 16);
                     memcpy(g_PCAggressiveBackup, aggressiveVector, 16);
                     memcpy(passiveVector, xboxVector, 16);
                     memcpy(aggressiveVector, xboxVector, 16);
 
-                    // Tooltip Override
                     g_OriginalTooltipEnabled = *pTooltipEnabled;
                     g_OriginalTooltipNew = *pTooltipNew;
                     *pTooltipEnabled = false;
@@ -442,21 +489,41 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
                     memcpy(aggressiveVector, g_PCAggressiveBackup, 16);
                 }
                 else {
-                    // Tooltip Restore
                     *pTooltipEnabled = g_OriginalTooltipEnabled;
                     *pTooltipNew = g_OriginalTooltipNew;
-
                     ((ApplyValues_t)Retail::ADDR_APPLY_VALUES)(pProfileManager);
                 }
             }
         }
     }
 
+    // --- CUSTOM UI CROSSFADER ---
+    double currentTime = GFGetTime();
+    float deltaTime = (float)(currentTime - g_LastFrameTime);
+    g_LastFrameTime = currentTime;
+
+    if (deltaTime > 0.1f || deltaTime < 0.0f) deltaTime = 0.016f;
+
+    bool showSpecial = *(bool*)((uintptr_t)_this + Retail::OFFSET_SHOW_SPECIAL_BUTTONS);
+
+    // INCREASED FADE SPEED (80% faster than 5.0f)
+    float fadeSpeed = 9.0f;
+
+    if (showSpecial) {
+        g_CrossfadeAlpha += deltaTime * fadeSpeed;
+        if (g_CrossfadeAlpha > 1.0f) g_CrossfadeAlpha = 1.0f;
+    }
+    else {
+        g_CrossfadeAlpha -= deltaTime * fadeSpeed;
+        if (g_CrossfadeAlpha < 0.0f) g_CrossfadeAlpha = 0.0f;
+    }
+    // ----------------------------
+
     o_CPlayerGui_Update(_this, paused);
 }
 
 // =================================================================================
-// 5. THE DIRECTINPUT FILTER & MASKING
+// 5. DIRECTINPUT VTABLE HOOKS
 // =================================================================================
 
 typedef HRESULT(WINAPI* tGetDeviceData)(IDirectInputDevice8W* _this, DWORD cbObjectData, LPDIDEVICEOBJECTDATA rgdod, LPDWORD pdwInOut, DWORD dwFlags);
@@ -478,7 +545,6 @@ DWORD TranslateStadiaButtonOffset(DWORD rawOffset) {
 void TrackStadiaPOV(DWORD povValue) {
     WORD oldMask = g_CurrentDPadMask;
     g_CurrentDPadMask = 0;
-
     if (LOWORD(povValue) != 0xFFFF) {
         if (povValue == 0 || povValue == 31500 || povValue == 4500) g_CurrentDPadMask |= DPAD_MASK_UP;
         if (povValue == 18000 || povValue == 13500 || povValue == 22500) g_CurrentDPadMask |= DPAD_MASK_DOWN;
@@ -490,22 +556,18 @@ void TrackStadiaPOV(DWORD povValue) {
 HRESULT WINAPI HookedGetDeviceState(IDirectInputDevice8W* _this, DWORD cbData, LPVOID lpvData) {
     HRESULT hr = oGetDeviceState(_this, cbData, lpvData);
 
-    if (_this != nullptr && _this != g_pMouse && _this != g_pKeyboard) {
-        if (SUCCEEDED(hr) && cbData == sizeof(DIJOYSTATE)) {
-            DIJOYSTATE* js = (DIJOYSTATE*)lpvData;
+    if (SUCCEEDED(hr) && cbData == sizeof(DIJOYSTATE)) {
+        DIJOYSTATE* js = (DIJOYSTATE*)lpvData;
+        TrackStadiaPOV(js->rgdwPOV[0]);
 
-            TrackStadiaPOV(js->rgdwPOV[0]);
+        for (int i = 0; i < 32; i++) { if (js->rgbButtons[i] & 0x80) g_IsControllerActive = true; }
+        for (int i = 0; i < 4; i++) { if (js->rgdwPOV[i] != -1 && js->rgdwPOV[i] != 65535) g_IsControllerActive = true; }
 
-            g_RightTriggerHeld = (js->lZ < -100) || (js->rgbButtons[7] & 0x80) || (js->rgbButtons[8] & 0x80);
-
-            for (int i = 0; i < 32; i++) { if (js->rgbButtons[i] & 0x80) g_IsControllerActive = true; }
-            for (int i = 0; i < 4; i++) { if (js->rgdwPOV[i] != -1 && js->rgdwPOV[i] != 65535) g_IsControllerActive = true; }
-
-            if (!g_InjectedThisFrame) {
-                ProcessDPadInjection();
-                g_InjectedThisFrame = true;
-            }
+        if (!g_InjectedThisFrame) {
+            ProcessDPadInjection();
+            g_InjectedThisFrame = true;
         }
+
         if (!g_IsControllerActive) return DIERR_NOTACQUIRED;
     }
     return hr;
@@ -513,28 +575,33 @@ HRESULT WINAPI HookedGetDeviceState(IDirectInputDevice8W* _this, DWORD cbData, L
 
 HRESULT WINAPI HookedGetDeviceData(IDirectInputDevice8W* _this, DWORD cbObjectData, LPDIDEVICEOBJECTDATA rgdod, LPDWORD pdwInOut, DWORD dwFlags) {
     HRESULT hr = oGetDeviceData(_this, cbObjectData, rgdod, pdwInOut, dwFlags);
-
     if (FAILED(hr) || rgdod == nullptr || pdwInOut == nullptr || *pdwInOut == 0) return hr;
 
-    if (_this == g_pMouse) {
-        bool significantInput = false;
-        for (DWORD i = 0; i < *pdwInOut; i++) {
-            DWORD ofs = rgdod[i].dwOfs;
-            int data = (int)rgdod[i].dwData;
-            if (ofs >= 0x0C && ofs <= 0x0F && data != 0) significantInput = true;
-            if ((ofs == 0x00 || ofs == 0x04) && (data > 2 || data < -2)) significantInput = true;
-        }
-        if (significantInput && g_IsControllerActive) g_IsControllerActive = false;
-        return hr;
-    }
+    DIDEVICEINSTANCEW diDevInfo;
+    diDevInfo.dwSize = sizeof(DIDEVICEINSTANCEW);
+    if (SUCCEEDED(_this->GetDeviceInfo(&diDevInfo))) {
+        DWORD devType = diDevInfo.dwDevType & 0xFF;
 
-    if (_this == g_pKeyboard) {
-        bool keyPressed = false;
-        for (DWORD i = 0; i < *pdwInOut; i++) {
-            if ((rgdod[i].dwData & 0x80) != 0) keyPressed = true;
+        if (devType == DI8DEVTYPE_MOUSE) {
+            bool significantInput = false;
+            for (DWORD i = 0; i < *pdwInOut; i++) {
+                DWORD ofs = rgdod[i].dwOfs;
+                int data = (int)rgdod[i].dwData;
+                if (ofs >= 0x0C && ofs <= 0x0F && data != 0) significantInput = true;
+                if ((ofs == 0x00 || ofs == 0x04) && (data > 2 || data < -2)) significantInput = true;
+            }
+            if (significantInput && g_IsControllerActive) g_IsControllerActive = false;
+            return hr;
         }
-        if (keyPressed && g_IsControllerActive) g_IsControllerActive = false;
-        return hr;
+
+        if (devType == DI8DEVTYPE_KEYBOARD) {
+            bool keyPressed = false;
+            for (DWORD i = 0; i < *pdwInOut; i++) {
+                if ((rgdod[i].dwData & 0x80) != 0) keyPressed = true;
+            }
+            if (keyPressed && g_IsControllerActive) g_IsControllerActive = false;
+            return hr;
+        }
     }
 
     if (!g_IsControllerActive) g_IsControllerActive = true;
@@ -547,52 +614,41 @@ HRESULT WINAPI HookedGetDeviceData(IDirectInputDevice8W* _this, DWORD cbObjectDa
         else if (originalOffset == DIJOFS_POV(0)) {
             TrackStadiaPOV(rgdod[i].dwData);
         }
-        else if (originalOffset == DIJOFS_Z) {
-            g_RightTriggerHeld = ((int)rgdod[i].dwData < -100);
-        }
-        else if (originalOffset == DIJOFS_BUTTON(7) || originalOffset == DIJOFS_BUTTON(8)) {
-            g_RightTriggerHeld = ((rgdod[i].dwData & 0x80) != 0);
-        }
     }
     return hr;
 }
 
-typedef HRESULT(WINAPI* tDirectInput8Create)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
-tDirectInput8Create oDirectInput8Create = nullptr;
+void HookDInputVTable() {
+    HMODULE hDI8 = GetModuleHandleA("dinput8.dll");
+    if (!hDI8) hDI8 = LoadLibraryA("dinput8.dll");
+    if (!hDI8) return;
 
-typedef HRESULT(WINAPI* tCreateDevice)(IDirectInput8W*, REFGUID, LPDIRECTINPUTDEVICE8W*, LPUNKNOWN);
-tCreateDevice oCreateDevice = nullptr;
+    typedef HRESULT(WINAPI* tDirectInput8Create)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
+    tDirectInput8Create pDirectInput8Create = (tDirectInput8Create)GetProcAddress(hDI8, "DirectInput8Create");
+    if (!pDirectInput8Create) return;
 
-HRESULT WINAPI HookedCreateDevice(IDirectInput8W* _this, REFGUID rguid, LPDIRECTINPUTDEVICE8W* lplpDirectInputDevice, LPUNKNOWN punkOuter) {
-    HRESULT hr = oCreateDevice(_this, rguid, lplpDirectInputDevice, punkOuter);
-    if (SUCCEEDED(hr) && lplpDirectInputDevice != nullptr && *lplpDirectInputDevice != nullptr) {
-        if (rguid == GUID_SysMouse) g_pMouse = *lplpDirectInputDevice;
-        else if (rguid == GUID_SysKeyboard) g_pKeyboard = *lplpDirectInputDevice;
+    IDirectInput8W* pDI = nullptr;
+    if (FAILED(pDirectInput8Create(GetModuleHandle(nullptr), 0x0800, IID_IDirectInput8W, (LPVOID*)&pDI, nullptr))) return;
 
-        void** vTable = *(void***)(*lplpDirectInputDevice);
+    IDirectInputDevice8W* pDevice = nullptr;
 
-        if (oGetDeviceState == nullptr) {
-            MH_CreateHook(vTable[9], &HookedGetDeviceState, (LPVOID*)&oGetDeviceState);
+    if (SUCCEEDED(pDI->CreateDevice(GUID_SysMouse, &pDevice, nullptr))) {
+        void** vTable = *(void***)pDevice;
+
+        if (MH_CreateHook(vTable[9], &HookedGetDeviceState, (LPVOID*)&oGetDeviceState) == MH_OK) {
             MH_EnableHook(vTable[9]);
+            Log("Successfully hooked IDirectInputDevice8::GetDeviceState via VTable");
         }
-        if (oGetDeviceData == nullptr) {
-            MH_CreateHook(vTable[10], &HookedGetDeviceData, (LPVOID*)&oGetDeviceData);
+        if (MH_CreateHook(vTable[10], &HookedGetDeviceData, (LPVOID*)&oGetDeviceData) == MH_OK) {
             MH_EnableHook(vTable[10]);
+            Log("Successfully hooked IDirectInputDevice8::GetDeviceData via VTable");
         }
+        pDevice->Release();
     }
-    return hr;
-}
-
-HRESULT WINAPI HookedDirectInput8Create(HINSTANCE hinst, DWORD dwVersion, REFIID riidltf, LPVOID* ppvOut, LPUNKNOWN punkOuter) {
-    HRESULT hr = oDirectInput8Create(hinst, dwVersion, riidltf, ppvOut, punkOuter);
-    if (SUCCEEDED(hr) && ppvOut != nullptr && *ppvOut != nullptr) {
-        void** vTable = *(void***)(*ppvOut);
-        if (oCreateDevice == nullptr) {
-            MH_CreateHook(vTable[3], &HookedCreateDevice, (LPVOID*)&oCreateDevice);
-            MH_EnableHook(vTable[3]);
-        }
+    else {
+        Log("CRITICAL: Failed to create dummy DirectInput device. Hooks aborted.");
     }
-    return hr;
+    pDI->Release();
 }
 
 // =================================================================================
@@ -612,11 +668,19 @@ void InjectGUIHotswapHooks() {
     if (MH_CreateHook((LPVOID)Retail::ADDR_SET_CAMERA_MANAGER_DEF, &Hooked_SetCameraManagerDef, (LPVOID*)&o_SetCameraManagerDef) == MH_OK) {
         MH_EnableHook((LPVOID)Retail::ADDR_SET_CAMERA_MANAGER_DEF);
     }
+    // Re-enabled your UI hooks
     if (MH_CreateHook((LPVOID)Retail::ADDR_IS_QUICK_ACCESS, &Hooked_IsQuickAccess, (LPVOID*)&o_IsQuickAccess) == MH_OK) {
         MH_EnableHook((LPVOID)Retail::ADDR_IS_QUICK_ACCESS);
     }
     if (MH_CreateHook((LPVOID)Retail::ADDR_IS_CONTEXT_SENSITIVE, &Hooked_IsContextSensitive, (LPVOID*)&o_IsContextSensitive) == MH_OK) {
         MH_EnableHook((LPVOID)Retail::ADDR_IS_CONTEXT_SENSITIVE);
+    }
+    // Added the new core logic hooks!
+    if (MH_CreateHook((LPVOID)Retail::ADDR_IS_EVENT_QA, &Hooked_IsEventQA, (LPVOID*)&o_IsEventQA) == MH_OK) {
+        MH_EnableHook((LPVOID)Retail::ADDR_IS_EVENT_QA);
+    }
+    if (MH_CreateHook((LPVOID)Retail::ADDR_IS_EVENT_CS, &Hooked_IsEventCS, (LPVOID*)&o_IsEventCS) == MH_OK) {
+        MH_EnableHook((LPVOID)Retail::ADDR_IS_EVENT_CS);
     }
     if (MH_CreateHook((LPVOID)Retail::ADDR_DRAW_ICON, &Hooked_DrawIcon, (LPVOID*)&o_DrawIcon) == MH_OK) {
         MH_EnableHook((LPVOID)Retail::ADDR_DRAW_ICON);
@@ -644,16 +708,7 @@ static DWORD WINAPI MainThread(LPVOID) {
 
     if (MH_Initialize() == MH_OK) {
         InjectGUIHotswapHooks();
-
-        HMODULE hDI8 = GetModuleHandleA("dinput8.dll");
-        if (!hDI8) hDI8 = LoadLibraryA("dinput8.dll");
-        if (hDI8) {
-            void* pDirectInput8Create = GetProcAddress(hDI8, "DirectInput8Create");
-            if (pDirectInput8Create) {
-                MH_CreateHook(pDirectInput8Create, &HookedDirectInput8Create, (LPVOID*)&oDirectInput8Create);
-                MH_EnableHook(pDirectInput8Create);
-            }
-        }
+        HookDInputVTable();
     }
     return 0;
 }
