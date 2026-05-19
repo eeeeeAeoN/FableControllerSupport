@@ -67,6 +67,10 @@ namespace Retail {
 
     // Exact byte address of the '02' in the 'cmp eax, 02' instruction for CTCTavernGame (Minigames)
     constexpr uintptr_t ADDR_TAVERN_BETTING_EVENT_CHECK = 0x005EC3C6;
+
+    // --- Boast UI Specific ---
+    constexpr uintptr_t ADDR_NUISYSTEM_GETINSTANCE = 0x0041E5F2;
+    constexpr uintptr_t ADDR_BOASTUI_PROCESSINPUT = 0x00690E70;
 }
 
 // --- Global State ---
@@ -168,6 +172,15 @@ IsEventQA_t o_IsEventQA = nullptr;
 typedef char(__thiscall* IsEventCS_t)(void* _this, const void* event, int* item_index);
 IsEventCS_t o_IsEventCS = nullptr;
 
+// --- Boast UI Typedefs ---
+typedef void(__thiscall* ProcessBoastInput_t)(void* _this, const EngineInputEvent* event, void* processed_input);
+ProcessBoastInput_t o_ProcessBoastInput = nullptr;
+
+typedef void* (*NUISystem_GetInstance_t)();
+NUISystem_GetInstance_t NUISystem_GetInstance = (NUISystem_GetInstance_t)Retail::ADDR_NUISYSTEM_GETINSTANCE;
+
+typedef void(__thiscall* NUISystem_SendEvent_t)(void* _this, int eventId);
+
 // =================================================================================
 // 2. THE D-PAD VECTOR INJECTOR
 // =================================================================================
@@ -237,6 +250,39 @@ void __fastcall Hooked_CInputManager_Update(void* _this, void* edx) {
 // =================================================================================
 // 3. THE DEFINITION, UI, & LOGIC INTERCEPTORS 
 // =================================================================================
+
+// --- Boast UI Interceptor ---
+void __fastcall Hooked_ProcessBoastInput(void* _this, void* edx, const EngineInputEvent* event, void* processed_input) {
+    // 19 = IE_JOYSTICK_BUTTON_PRESSED
+    if (g_IsControllerActive && event->DeviceType == 1 && event->EventType == 19) {
+
+        int nuiMessage = -1;
+
+        // Map D-Pad buttons to NUISystem directions
+        switch (event->JoystickButton) {
+        case 13: nuiMessage = 0; break; // D-Pad Up
+        case 14: nuiMessage = 1; break; // D-Pad Down
+        case 15: nuiMessage = 2; break; // D-Pad Left (Back)
+        case 16: nuiMessage = 3; break; // D-Pad Right (OK)
+        }
+
+        if (nuiMessage != -1) {
+            void* pNUIManager = NUISystem_GetInstance();
+            if (pNUIManager) {
+                void** vTable = *(void***)pNUIManager;
+                NUISystem_SendEvent_t SendEvent = (NUISystem_SendEvent_t)vTable[0];
+                SendEvent(pNUIManager, nuiMessage);
+            }
+
+            // Flag as processed
+            *(bool*)processed_input = true;
+
+            return;
+        }
+    }
+
+    o_ProcessBoastInput(_this, event, processed_input);
+}
 
 char __fastcall Hooked_IsEventQA(void* _this, void* edx, const void* event, int* item_index) {
     if (g_IsControllerActive && g_pPlayerGui) {
@@ -401,22 +447,17 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
         void** currentAbilityPtr = (void**)((uintptr_t)_this + Retail::OFFSET_PDRAW_ABILITY_BUTTONS);
         void** currentQuickAccessPtr = (void**)((uintptr_t)_this + Retail::OFFSET_PDRAW_QUICK_ACCESS);
 
-        // =========================================================================
-        // DYNAMIC BETTING PATCH
-        // Swaps the 'cmp eax, 0x02' in CTCBetting & CTCTavernGame 
-        // to 'cmp eax, 0x11' when active.
-        // =========================================================================
         DWORD oldProtect1, oldProtect2;
         if (VirtualProtect((LPVOID)Retail::ADDR_BETTING_EVENT_CHECK, 1, PAGE_EXECUTE_READWRITE, &oldProtect1) &&
             VirtualProtect((LPVOID)Retail::ADDR_TAVERN_BETTING_EVENT_CHECK, 1, PAGE_EXECUTE_READWRITE, &oldProtect2)) {
 
             if (requestedState) {
-                *(uint8_t*)Retail::ADDR_BETTING_EVENT_CHECK = 0x11; // IE_JOYSTICK_POSITION
+                *(uint8_t*)Retail::ADDR_BETTING_EVENT_CHECK = 0x11;
                 *(uint8_t*)Retail::ADDR_TAVERN_BETTING_EVENT_CHECK = 0x11;
                 Log("Betting UI updated to Controller Mode (0x11)");
             }
             else {
-                *(uint8_t*)Retail::ADDR_BETTING_EVENT_CHECK = 0x02; // IE_KEY_HELD
+                *(uint8_t*)Retail::ADDR_BETTING_EVENT_CHECK = 0x02;
                 *(uint8_t*)Retail::ADDR_TAVERN_BETTING_EVENT_CHECK = 0x02;
                 Log("Betting UI reverted to PC Mode (0x02)");
             }
@@ -675,6 +716,14 @@ void InjectGUIHotswapHooks() {
     }
     if (MH_CreateHook((LPVOID)Retail::ADDR_DRAW_ICON, &Hooked_DrawIcon, (LPVOID*)&o_DrawIcon) == MH_OK) {
         MH_EnableHook((LPVOID)Retail::ADDR_DRAW_ICON);
+    }
+
+    // --- New Boast UI Hook Deployment ---
+    if (Retail::ADDR_BOASTUI_PROCESSINPUT != 0x0) {
+        if (MH_CreateHook((LPVOID)Retail::ADDR_BOASTUI_PROCESSINPUT, &Hooked_ProcessBoastInput, (LPVOID*)&o_ProcessBoastInput) == MH_OK) {
+            MH_EnableHook((LPVOID)Retail::ADDR_BOASTUI_PROCESSINPUT);
+            Log("Boast UI Input Hook Deployed.");
+        }
     }
 
     if (Retail::ADDR_ISTOGGLE_ZTARGET != 0x0) {
