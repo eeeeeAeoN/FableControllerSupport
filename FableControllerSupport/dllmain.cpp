@@ -1,6 +1,7 @@
 // ---------------------------------------------------------
 // Project EgoCore - Controller Support UI & Camera Injection
 // Developer: AlbionSecrets
+// Architecture: VTable Hooks (Original Working + Alt-Tab Fix)
 // ---------------------------------------------------------
 #include <windows.h>
 #include <dinput.h>
@@ -64,11 +65,10 @@ namespace Retail {
 
     // Exact byte address of the '02' in the 'cmp eax, 02' instruction for CTCBetting (Temples/General)
     constexpr uintptr_t ADDR_BETTING_EVENT_CHECK = 0x007E52EE;
-
     // Exact byte address of the '02' in the 'cmp eax, 02' instruction for CTCTavernGame (Minigames)
     constexpr uintptr_t ADDR_TAVERN_BETTING_EVENT_CHECK = 0x005EC3C6;
 
-    // --- Boast UI Specific ---
+    // Boast UI Specific
     constexpr uintptr_t ADDR_NUISYSTEM_GETINSTANCE = 0x0041E5F2;
     constexpr uintptr_t ADDR_BOASTUI_PROCESSINPUT = 0x00690E70;
 }
@@ -172,7 +172,6 @@ IsEventQA_t o_IsEventQA = nullptr;
 typedef char(__thiscall* IsEventCS_t)(void* _this, const void* event, int* item_index);
 IsEventCS_t o_IsEventCS = nullptr;
 
-// --- Boast UI Typedefs ---
 typedef void(__thiscall* ProcessBoastInput_t)(void* _this, const EngineInputEvent* event, void* processed_input);
 ProcessBoastInput_t o_ProcessBoastInput = nullptr;
 
@@ -251,19 +250,14 @@ void __fastcall Hooked_CInputManager_Update(void* _this, void* edx) {
 // 3. THE DEFINITION, UI, & LOGIC INTERCEPTORS 
 // =================================================================================
 
-// --- Boast UI Interceptor ---
 void __fastcall Hooked_ProcessBoastInput(void* _this, void* edx, const EngineInputEvent* event, void* processed_input) {
-    // 19 = IE_JOYSTICK_BUTTON_PRESSED
     if (g_IsControllerActive && event->DeviceType == 1 && event->EventType == 19) {
-
         int nuiMessage = -1;
-
-        // Map D-Pad buttons to NUISystem directions
         switch (event->JoystickButton) {
-        case 13: nuiMessage = 0; break; // D-Pad Up
-        case 14: nuiMessage = 1; break; // D-Pad Down
-        case 15: nuiMessage = 2; break; // D-Pad Left (Back)
-        case 16: nuiMessage = 3; break; // D-Pad Right (OK)
+        case 13: nuiMessage = 0; break;
+        case 14: nuiMessage = 1; break;
+        case 15: nuiMessage = 2; break;
+        case 16: nuiMessage = 3; break;
         }
 
         if (nuiMessage != -1) {
@@ -273,14 +267,10 @@ void __fastcall Hooked_ProcessBoastInput(void* _this, void* edx, const EngineInp
                 NUISystem_SendEvent_t SendEvent = (NUISystem_SendEvent_t)vTable[0];
                 SendEvent(pNUIManager, nuiMessage);
             }
-
-            // Flag as processed
             *(bool*)processed_input = true;
-
             return;
         }
     }
-
     o_ProcessBoastInput(_this, event, processed_input);
 }
 
@@ -566,6 +556,10 @@ tGetDeviceData oGetDeviceData = nullptr;
 typedef HRESULT(WINAPI* tGetDeviceState)(IDirectInputDevice8W* _this, DWORD cbData, LPVOID lpvData);
 tGetDeviceState oGetDeviceState = nullptr;
 
+typedef HRESULT(WINAPI* tSetCooperativeLevel)(IDirectInputDevice8W* _this, HWND hwnd, DWORD dwFlags);
+tSetCooperativeLevel oSetCooperativeLevel = nullptr;
+
+
 DWORD TranslateStadiaButtonOffset(DWORD rawOffset) {
     switch (rawOffset) {
     case 0x30: return 0x33; case 0x31: return 0x34; case 0x32: return 0x30;
@@ -585,6 +579,15 @@ void TrackStadiaPOV(DWORD povValue) {
         if (povValue == 27000 || povValue == 22500 || povValue == 31500) g_CurrentDPadMask |= DPAD_MASK_LEFT;
         if (povValue == 9000 || povValue == 4500 || povValue == 13500) g_CurrentDPadMask |= DPAD_MASK_RIGHT;
     }
+}
+
+// --- THE ALT-TAB SAVIOR ---
+HRESULT WINAPI HookedSetCooperativeLevel(IDirectInputDevice8W* _this, HWND hwnd, DWORD dwFlags) {
+    // We rewrite the flags Fable passes to Windows. 
+    // By forcing BACKGROUND and NONEXCLUSIVE, Windows will NEVER drop the controller on Alt-Tab.
+    // Fable never receives a DIERR_INPUTLOST, preventing the engine from internally breaking.
+    DWORD newFlags = DISCL_BACKGROUND | DISCL_NONEXCLUSIVE;
+    return oSetCooperativeLevel(_this, hwnd, newFlags);
 }
 
 HRESULT WINAPI HookedGetDeviceState(IDirectInputDevice8W* _this, DWORD cbData, LPVOID lpvData) {
@@ -671,11 +674,16 @@ void HookDInputVTable() {
 
         if (MH_CreateHook(vTable[9], &HookedGetDeviceState, (LPVOID*)&oGetDeviceState) == MH_OK) {
             MH_EnableHook(vTable[9]);
-            Log("Successfully hooked IDirectInputDevice8::GetDeviceState via VTable");
+            Log("Successfully hooked IDirectInputDevice8::GetDeviceState");
         }
         if (MH_CreateHook(vTable[10], &HookedGetDeviceData, (LPVOID*)&oGetDeviceData) == MH_OK) {
             MH_EnableHook(vTable[10]);
-            Log("Successfully hooked IDirectInputDevice8::GetDeviceData via VTable");
+            Log("Successfully hooked IDirectInputDevice8::GetDeviceData");
+        }
+        // Deploy the Alt-Tab Savior Hook
+        if (MH_CreateHook(vTable[13], &HookedSetCooperativeLevel, (LPVOID*)&oSetCooperativeLevel) == MH_OK) {
+            MH_EnableHook(vTable[13]);
+            Log("Successfully hooked IDirectInputDevice8::SetCooperativeLevel (Alt-Tab Fix)");
         }
         pDevice->Release();
     }
@@ -718,7 +726,6 @@ void InjectGUIHotswapHooks() {
         MH_EnableHook((LPVOID)Retail::ADDR_DRAW_ICON);
     }
 
-    // --- New Boast UI Hook Deployment ---
     if (Retail::ADDR_BOASTUI_PROCESSINPUT != 0x0) {
         if (MH_CreateHook((LPVOID)Retail::ADDR_BOASTUI_PROCESSINPUT, &Hooked_ProcessBoastInput, (LPVOID*)&o_ProcessBoastInput) == MH_OK) {
             MH_EnableHook((LPVOID)Retail::ADDR_BOASTUI_PROCESSINPUT);
