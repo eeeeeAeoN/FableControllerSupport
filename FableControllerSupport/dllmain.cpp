@@ -1,16 +1,18 @@
 // ---------------------------------------------------------
 // Project EgoCore - Controller Support UI & Camera Injection
 // Developer: AlbionSecrets
-// Architecture: VTable Hooks (Original Working + Alt-Tab Fix)
+// Architecture: VTable Hooks (Direct Engine XInput Injection + Direct Axis Swap)
 // ---------------------------------------------------------
 #include <windows.h>
 #include <dinput.h>
+#include <xinput.h>
 #include <initguid.h> 
 #include "MinHook.h"
 #include <fstream>
 #include <string>
 #include <mutex>
 #include <stdio.h> 
+#include <cmath>
 
 #pragma comment(lib, "dinput8.lib")
 #pragma comment(lib, "dxguid.lib")
@@ -24,6 +26,21 @@ void Log(const std::string& message) {
     if (g_Log.is_open()) {
         g_Log << "[EgoCore] " << message << std::endl;
         g_Log.flush();
+    }
+}
+
+// --- Dynamic XInput Loader ---
+typedef DWORD(WINAPI* XInputGetState_t)(DWORD dwUserIndex, XINPUT_STATE* pState);
+XInputGetState_t DynXInputGetState = nullptr;
+
+void InitializeXInput() {
+    HMODULE hXInput = LoadLibraryA("xinput1_4.dll");
+    if (!hXInput) hXInput = LoadLibraryA("xinput1_3.dll");
+    if (!hXInput) hXInput = LoadLibraryA("xinput9_1_0.dll");
+
+    if (hXInput) {
+        DynXInputGetState = (XInputGetState_t)GetProcAddress(hXInput, "XInputGetState");
+        if (DynXInputGetState) Log("XInput dynamically loaded successfully.");
     }
 }
 
@@ -63,12 +80,9 @@ namespace Retail {
     constexpr uintptr_t ADDR_IS_EVENT_QA = 0x00446000;
     constexpr uintptr_t ADDR_IS_EVENT_CS = 0x00446110;
 
-    // Exact byte address of the '02' in the 'cmp eax, 02' instruction for CTCBetting (Temples/General)
     constexpr uintptr_t ADDR_BETTING_EVENT_CHECK = 0x007E52EE;
-    // Exact byte address of the '02' in the 'cmp eax, 02' instruction for CTCTavernGame (Minigames)
     constexpr uintptr_t ADDR_TAVERN_BETTING_EVENT_CHECK = 0x005EC3C6;
 
-    // Boast UI Specific
     constexpr uintptr_t ADDR_NUISYSTEM_GETINSTANCE = 0x0041E5F2;
     constexpr uintptr_t ADDR_BOASTUI_PROCESSINPUT = 0x00690E70;
 }
@@ -84,6 +98,10 @@ double g_LastFrameTime = 0.0;
 
 bool g_OriginalTooltipEnabled = true;
 bool g_OriginalTooltipNew = true;
+
+// XInput Slot Tracking
+DWORD g_ActiveXInputSlot = (DWORD)-1;
+XINPUT_GAMEPAD g_LastXInput = { 0 };
 
 // =================================================================================
 // 1. ENGINE MEMORY STRUCTURES
@@ -181,7 +199,7 @@ NUISystem_GetInstance_t NUISystem_GetInstance = (NUISystem_GetInstance_t)Retail:
 typedef void(__thiscall* NUISystem_SendEvent_t)(void* _this, int eventId);
 
 // =================================================================================
-// 2. THE D-PAD VECTOR INJECTOR
+// 2. NATIVE EVENT INJECTORS (D-PAD & XINPUT)
 // =================================================================================
 void PushEventToVector(void* pInputManager, uint8_t buttonId, uint32_t eventType, uint32_t deviceNum) {
     EngineInputEvent** _Myfirst = (EngineInputEvent**)((uintptr_t)pInputManager + 0x10);
@@ -207,6 +225,80 @@ void PushEventToVector(void* pInputManager, uint8_t buttonId, uint32_t eventType
 
     *_Mylast = (EngineInputEvent*)((uintptr_t)(*_Mylast) + sizeof(EngineInputEvent));
     (*NoStoredEvents)++;
+}
+
+bool UpdateActiveXInputSlot(XINPUT_STATE& outState) {
+    if (!DynXInputGetState) return false;
+
+    if (g_ActiveXInputSlot != (DWORD)-1) {
+        if (DynXInputGetState(g_ActiveXInputSlot, &outState) == ERROR_SUCCESS) return true;
+        g_ActiveXInputSlot = (DWORD)-1;
+    }
+
+    for (DWORD i = 0; i < 4; i++) {
+        XINPUT_STATE tmp;
+        if (DynXInputGetState(i, &tmp) == ERROR_SUCCESS) {
+            if (tmp.Gamepad.wButtons != 0 ||
+                tmp.Gamepad.bLeftTrigger > 30 || tmp.Gamepad.bRightTrigger > 30 ||
+                abs(tmp.Gamepad.sThumbLX) > 8000 || abs(tmp.Gamepad.sThumbLY) > 8000 ||
+                abs(tmp.Gamepad.sThumbRX) > 8000 || abs(tmp.Gamepad.sThumbRY) > 8000)
+            {
+                outState = tmp;
+                g_ActiveXInputSlot = i;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void ProcessNativeXInputInjection(const XINPUT_STATE& state) {
+    if (!g_pInputManager) return;
+
+    auto Inject = [&](bool isHeld, bool wasHeld, uint8_t btnId) {
+        uint32_t eventType = 0;
+        if (isHeld && !wasHeld) eventType = 19;
+        else if (isHeld && wasHeld) eventType = 20;
+        else if (!isHeld && wasHeld) eventType = 21;
+
+        if (eventType != 0) {
+            PushEventToVector(g_pInputManager, btnId, eventType, 0);
+            PushEventToVector(g_pInputManager, btnId, eventType, 1);
+            PushEventToVector(g_pInputManager, btnId, eventType, 2);
+        }
+        };
+
+    WORD btns = state.Gamepad.wButtons;
+    WORD lastBtns = g_LastXInput.wButtons;
+
+    // Direct mapping to Fable's EXboxControllerButton Enums. ZERO SHIFT.
+    Inject(btns & XINPUT_GAMEPAD_X, lastBtns & XINPUT_GAMEPAD_X, 1); // X
+    Inject(btns & XINPUT_GAMEPAD_Y, lastBtns & XINPUT_GAMEPAD_Y, 2); // Y
+    Inject(btns & XINPUT_GAMEPAD_RIGHT_SHOULDER, lastBtns & XINPUT_GAMEPAD_RIGHT_SHOULDER, 3); // Black / RB
+    Inject(btns & XINPUT_GAMEPAD_A, lastBtns & XINPUT_GAMEPAD_A, 4); // A
+    Inject(btns & XINPUT_GAMEPAD_B, lastBtns & XINPUT_GAMEPAD_B, 5); // B
+    Inject(btns & XINPUT_GAMEPAD_LEFT_SHOULDER, lastBtns & XINPUT_GAMEPAD_LEFT_SHOULDER, 6); // White / LB
+
+    // Triggers as Buttons
+    Inject(state.Gamepad.bLeftTrigger > 30, g_LastXInput.bLeftTrigger > 30, 7); // LT
+    Inject(state.Gamepad.bRightTrigger > 30, g_LastXInput.bRightTrigger > 30, 8); // RT
+
+    // Stick Clicks
+    Inject(btns & XINPUT_GAMEPAD_LEFT_THUMB, lastBtns & XINPUT_GAMEPAD_LEFT_THUMB, 9); // LS Click
+    Inject(btns & XINPUT_GAMEPAD_RIGHT_THUMB, lastBtns & XINPUT_GAMEPAD_RIGHT_THUMB, 10); // RS Click
+
+    // Start / Back
+    Inject(btns & XINPUT_GAMEPAD_START, lastBtns & XINPUT_GAMEPAD_START, 11); // Start
+    Inject(btns & XINPUT_GAMEPAD_BACK, lastBtns & XINPUT_GAMEPAD_BACK, 12); // Back
+
+    // D-Pad
+    Inject(btns & XINPUT_GAMEPAD_DPAD_UP, lastBtns & XINPUT_GAMEPAD_DPAD_UP, 13);
+    Inject(btns & XINPUT_GAMEPAD_DPAD_DOWN, lastBtns & XINPUT_GAMEPAD_DPAD_DOWN, 14);
+    Inject(btns & XINPUT_GAMEPAD_DPAD_LEFT, lastBtns & XINPUT_GAMEPAD_DPAD_LEFT, 15);
+    Inject(btns & XINPUT_GAMEPAD_DPAD_RIGHT, lastBtns & XINPUT_GAMEPAD_DPAD_RIGHT, 16);
+
+    g_LastXInput = state.Gamepad;
+    g_IsControllerActive = true;
 }
 
 void ProcessDPadInjection() {
@@ -241,7 +333,12 @@ void __fastcall Hooked_CInputManager_Update(void* _this, void* edx) {
 
     o_CInputManager_Update(_this);
 
-    if (!g_InjectedThisFrame) {
+    XINPUT_STATE xState;
+    if (UpdateActiveXInputSlot(xState)) {
+        ProcessNativeXInputInjection(xState);
+        g_InjectedThisFrame = true;
+    }
+    else if (!g_InjectedThisFrame) {
         ProcessDPadInjection();
     }
 }
@@ -379,6 +476,8 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
         g_CurrentActiveCameraDef = nullptr;
         g_LastControllerState = false;
         g_CrossfadeAlpha = 0.0f;
+        g_ActiveXInputSlot = (DWORD)-1;
+        memset(&g_LastXInput, 0, sizeof(g_LastXInput));
     }
 
     if (!g_ShadowObjectsInitialized) {
@@ -444,12 +543,10 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
             if (requestedState) {
                 *(uint8_t*)Retail::ADDR_BETTING_EVENT_CHECK = 0x11;
                 *(uint8_t*)Retail::ADDR_TAVERN_BETTING_EVENT_CHECK = 0x11;
-                Log("Betting UI updated to Controller Mode (0x11)");
             }
             else {
                 *(uint8_t*)Retail::ADDR_BETTING_EVENT_CHECK = 0x02;
                 *(uint8_t*)Retail::ADDR_TAVERN_BETTING_EVENT_CHECK = 0x02;
-                Log("Betting UI reverted to PC Mode (0x02)");
             }
             VirtualProtect((LPVOID)Retail::ADDR_BETTING_EVENT_CHECK, 1, oldProtect1, &oldProtect1);
             VirtualProtect((LPVOID)Retail::ADDR_TAVERN_BETTING_EVENT_CHECK, 1, oldProtect2, &oldProtect2);
@@ -547,7 +644,7 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
 }
 
 // =================================================================================
-// 5. DIRECTINPUT VTABLE HOOKS
+// 5. DIRECTINPUT VTABLE HOOKS & XINPUT MUTING
 // =================================================================================
 
 typedef HRESULT(WINAPI* tGetDeviceData)(IDirectInputDevice8W* _this, DWORD cbObjectData, LPDIDEVICEOBJECTDATA rgdod, LPDWORD pdwInOut, DWORD dwFlags);
@@ -583,27 +680,39 @@ void TrackStadiaPOV(DWORD povValue) {
 
 // --- THE ALT-TAB SAVIOR ---
 HRESULT WINAPI HookedSetCooperativeLevel(IDirectInputDevice8W* _this, HWND hwnd, DWORD dwFlags) {
-    // We rewrite the flags Fable passes to Windows. 
-    // By forcing BACKGROUND and NONEXCLUSIVE, Windows will NEVER drop the controller on Alt-Tab.
-    // Fable never receives a DIERR_INPUTLOST, preventing the engine from internally breaking.
     DWORD newFlags = DISCL_BACKGROUND | DISCL_NONEXCLUSIVE;
     return oSetCooperativeLevel(_this, hwnd, newFlags);
 }
 
 HRESULT WINAPI HookedGetDeviceState(IDirectInputDevice8W* _this, DWORD cbData, LPVOID lpvData) {
+    // We let Fable natively populate and scale the buffer FIRST.
+    // This perfectly formats lX, lY, lRx, lRy to Fable's expected native bounds (-1000 to +1000 usually)
     HRESULT hr = oGetDeviceState(_this, cbData, lpvData);
 
     if (SUCCEEDED(hr) && cbData == sizeof(DIJOYSTATE)) {
         DIJOYSTATE* js = (DIJOYSTATE*)lpvData;
+
+        if (g_ActiveXInputSlot != (DWORD)-1) {
+            // Mute Windows Wrapper DInput buttons so Native Event Injection has full control
+            ZeroMemory(js->rgbButtons, sizeof(js->rgbButtons));
+            js->rgdwPOV[0] = -1;
+
+            // --- THE ELEGANT AXIS FIX ---
+            // Fable already pulled the XInput data and natively scaled it inside oGetDeviceState!
+            // BUT Windows puts the right stick on Rx/Ry, while Fable specifically expects it on Z/Rz.
+            // All we do is move the already-scaled data to the Z axis!
+            js->lZ = js->lRx;
+            js->lRz = js->lRy;
+
+            g_IsControllerActive = true;
+            return hr;
+        }
+
+        // --- FALLBACK STADIA / DPAD LOGIC ---
         TrackStadiaPOV(js->rgdwPOV[0]);
 
         for (int i = 0; i < 32; i++) { if (js->rgbButtons[i] & 0x80) g_IsControllerActive = true; }
         for (int i = 0; i < 4; i++) { if (js->rgdwPOV[i] != -1 && js->rgdwPOV[i] != 65535) g_IsControllerActive = true; }
-
-        if (!g_InjectedThisFrame) {
-            ProcessDPadInjection();
-            g_InjectedThisFrame = true;
-        }
 
         if (!g_IsControllerActive) return DIERR_NOTACQUIRED;
     }
@@ -627,7 +736,10 @@ HRESULT WINAPI HookedGetDeviceData(IDirectInputDevice8W* _this, DWORD cbObjectDa
                 if (ofs >= 0x0C && ofs <= 0x0F && data != 0) significantInput = true;
                 if ((ofs == 0x00 || ofs == 0x04) && (data > 2 || data < -2)) significantInput = true;
             }
-            if (significantInput && g_IsControllerActive) g_IsControllerActive = false;
+            if (significantInput && g_IsControllerActive) {
+                g_IsControllerActive = false;
+                g_ActiveXInputSlot = (DWORD)-1;
+            }
             return hr;
         }
 
@@ -636,9 +748,17 @@ HRESULT WINAPI HookedGetDeviceData(IDirectInputDevice8W* _this, DWORD cbObjectDa
             for (DWORD i = 0; i < *pdwInOut; i++) {
                 if ((rgdod[i].dwData & 0x80) != 0) keyPressed = true;
             }
-            if (keyPressed && g_IsControllerActive) g_IsControllerActive = false;
+            if (keyPressed && g_IsControllerActive) {
+                g_IsControllerActive = false;
+                g_ActiveXInputSlot = (DWORD)-1;
+            }
             return hr;
         }
+    }
+
+    if (g_ActiveXInputSlot != (DWORD)-1) {
+        *pdwInOut = 0;
+        return DI_OK;
     }
 
     if (!g_IsControllerActive) g_IsControllerActive = true;
@@ -680,7 +800,6 @@ void HookDInputVTable() {
             MH_EnableHook(vTable[10]);
             Log("Successfully hooked IDirectInputDevice8::GetDeviceData");
         }
-        // Deploy the Alt-Tab Savior Hook
         if (MH_CreateHook(vTable[13], &HookedSetCooperativeLevel, (LPVOID*)&oSetCooperativeLevel) == MH_OK) {
             MH_EnableHook(vTable[13]);
             Log("Successfully hooked IDirectInputDevice8::SetCooperativeLevel (Alt-Tab Fix)");
@@ -755,6 +874,7 @@ static DWORD WINAPI MainThread(LPVOID) {
     Log("EgoCore Engine Initializing...");
 
     if (MH_Initialize() == MH_OK) {
+        InitializeXInput();
         InjectGUIHotswapHooks();
         HookDInputVTable();
     }
