@@ -1,8 +1,3 @@
-// ---------------------------------------------------------
-// Project EgoCore - Controller Support UI & Camera Injection
-// Developer: AlbionSecrets
-// Architecture: VTable Hooks (Direct Engine XInput Injection + Direct Axis Swap)
-// ---------------------------------------------------------
 #include <windows.h>
 #include <dinput.h>
 #include <xinput.h>
@@ -17,7 +12,6 @@
 #pragma comment(lib, "dinput8.lib")
 #pragma comment(lib, "dxguid.lib")
 
-// --- Logger ---
 std::ofstream g_Log;
 std::mutex g_LogMutex;
 
@@ -29,7 +23,6 @@ void Log(const std::string& message) {
     }
 }
 
-// --- Dynamic XInput Loader ---
 typedef DWORD(WINAPI* XInputGetState_t)(DWORD dwUserIndex, XINPUT_STATE* pState);
 XInputGetState_t DynXInputGetState = nullptr;
 
@@ -44,7 +37,6 @@ void InitializeXInput() {
     }
 }
 
-// --- Engine Pointers & State ---
 namespace Retail {
     constexpr ptrdiff_t OFFSET_CWORLD_IN_GUI = 0x04;
     constexpr ptrdiff_t OFFSET_DEFMANAGER_IN_WORLD = 0x10;
@@ -87,7 +79,6 @@ namespace Retail {
     constexpr uintptr_t ADDR_BOASTUI_PROCESSINPUT = 0x00690E70;
 }
 
-// --- Global State ---
 bool g_IsControllerActive = false;
 bool g_LastControllerState = false;
 bool g_ShadowObjectsInitialized = false;
@@ -99,13 +90,11 @@ double g_LastFrameTime = 0.0;
 bool g_OriginalTooltipEnabled = true;
 bool g_OriginalTooltipNew = true;
 
-// XInput Slot Tracking
-DWORD g_ActiveXInputSlot = (DWORD)-1;
-XINPUT_GAMEPAD g_LastXInput = { 0 };
+static bool g_LT_State = false;
+static bool g_RT_State = false;
 
-// =================================================================================
-// 1. ENGINE MEMORY STRUCTURES
-// =================================================================================
+DWORD g_ActiveXInputSlot = (DWORD)-1;
+
 #pragma pack(push, 1)
 struct EngineInputEvent {
     uint8_t  Pad0[8];
@@ -150,7 +139,6 @@ void* g_XboxControlDef = nullptr;
 char g_PCPassiveBackup[16];
 char g_PCAggressiveBackup[16];
 
-// --- Function Typedefs ---
 typedef void(__thiscall* CPlayerGui_Update_t)(void* _this, bool paused);
 CPlayerGui_Update_t o_CPlayerGui_Update = nullptr;
 
@@ -198,9 +186,6 @@ NUISystem_GetInstance_t NUISystem_GetInstance = (NUISystem_GetInstance_t)Retail:
 
 typedef void(__thiscall* NUISystem_SendEvent_t)(void* _this, int eventId);
 
-// =================================================================================
-// 2. NATIVE EVENT INJECTORS (D-PAD & XINPUT)
-// =================================================================================
 void PushEventToVector(void* pInputManager, uint8_t buttonId, uint32_t eventType, uint32_t deviceNum) {
     EngineInputEvent** _Myfirst = (EngineInputEvent**)((uintptr_t)pInputManager + 0x10);
     EngineInputEvent** _Mylast = (EngineInputEvent**)((uintptr_t)pInputManager + 0x14);
@@ -225,80 +210,6 @@ void PushEventToVector(void* pInputManager, uint8_t buttonId, uint32_t eventType
 
     *_Mylast = (EngineInputEvent*)((uintptr_t)(*_Mylast) + sizeof(EngineInputEvent));
     (*NoStoredEvents)++;
-}
-
-bool UpdateActiveXInputSlot(XINPUT_STATE& outState) {
-    if (!DynXInputGetState) return false;
-
-    if (g_ActiveXInputSlot != (DWORD)-1) {
-        if (DynXInputGetState(g_ActiveXInputSlot, &outState) == ERROR_SUCCESS) return true;
-        g_ActiveXInputSlot = (DWORD)-1;
-    }
-
-    for (DWORD i = 0; i < 4; i++) {
-        XINPUT_STATE tmp;
-        if (DynXInputGetState(i, &tmp) == ERROR_SUCCESS) {
-            if (tmp.Gamepad.wButtons != 0 ||
-                tmp.Gamepad.bLeftTrigger > 30 || tmp.Gamepad.bRightTrigger > 30 ||
-                abs(tmp.Gamepad.sThumbLX) > 8000 || abs(tmp.Gamepad.sThumbLY) > 8000 ||
-                abs(tmp.Gamepad.sThumbRX) > 8000 || abs(tmp.Gamepad.sThumbRY) > 8000)
-            {
-                outState = tmp;
-                g_ActiveXInputSlot = i;
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-void ProcessNativeXInputInjection(const XINPUT_STATE& state) {
-    if (!g_pInputManager) return;
-
-    auto Inject = [&](bool isHeld, bool wasHeld, uint8_t btnId) {
-        uint32_t eventType = 0;
-        if (isHeld && !wasHeld) eventType = 19;
-        else if (isHeld && wasHeld) eventType = 20;
-        else if (!isHeld && wasHeld) eventType = 21;
-
-        if (eventType != 0) {
-            PushEventToVector(g_pInputManager, btnId, eventType, 0);
-            PushEventToVector(g_pInputManager, btnId, eventType, 1);
-            PushEventToVector(g_pInputManager, btnId, eventType, 2);
-        }
-        };
-
-    WORD btns = state.Gamepad.wButtons;
-    WORD lastBtns = g_LastXInput.wButtons;
-
-    // Direct mapping to Fable's EXboxControllerButton Enums. ZERO SHIFT.
-    Inject(btns & XINPUT_GAMEPAD_X, lastBtns & XINPUT_GAMEPAD_X, 1); // X
-    Inject(btns & XINPUT_GAMEPAD_Y, lastBtns & XINPUT_GAMEPAD_Y, 2); // Y
-    Inject(btns & XINPUT_GAMEPAD_RIGHT_SHOULDER, lastBtns & XINPUT_GAMEPAD_RIGHT_SHOULDER, 3); // Black / RB
-    Inject(btns & XINPUT_GAMEPAD_A, lastBtns & XINPUT_GAMEPAD_A, 4); // A
-    Inject(btns & XINPUT_GAMEPAD_B, lastBtns & XINPUT_GAMEPAD_B, 5); // B
-    Inject(btns & XINPUT_GAMEPAD_LEFT_SHOULDER, lastBtns & XINPUT_GAMEPAD_LEFT_SHOULDER, 6); // White / LB
-
-    // Triggers as Buttons
-    Inject(state.Gamepad.bLeftTrigger > 30, g_LastXInput.bLeftTrigger > 30, 7); // LT
-    Inject(state.Gamepad.bRightTrigger > 30, g_LastXInput.bRightTrigger > 30, 8); // RT
-
-    // Stick Clicks
-    Inject(btns & XINPUT_GAMEPAD_LEFT_THUMB, lastBtns & XINPUT_GAMEPAD_LEFT_THUMB, 9); // LS Click
-    Inject(btns & XINPUT_GAMEPAD_RIGHT_THUMB, lastBtns & XINPUT_GAMEPAD_RIGHT_THUMB, 10); // RS Click
-
-    // Start / Back
-    Inject(btns & XINPUT_GAMEPAD_START, lastBtns & XINPUT_GAMEPAD_START, 11); // Start
-    Inject(btns & XINPUT_GAMEPAD_BACK, lastBtns & XINPUT_GAMEPAD_BACK, 12); // Back
-
-    // D-Pad
-    Inject(btns & XINPUT_GAMEPAD_DPAD_UP, lastBtns & XINPUT_GAMEPAD_DPAD_UP, 13);
-    Inject(btns & XINPUT_GAMEPAD_DPAD_DOWN, lastBtns & XINPUT_GAMEPAD_DPAD_DOWN, 14);
-    Inject(btns & XINPUT_GAMEPAD_DPAD_LEFT, lastBtns & XINPUT_GAMEPAD_DPAD_LEFT, 15);
-    Inject(btns & XINPUT_GAMEPAD_DPAD_RIGHT, lastBtns & XINPUT_GAMEPAD_DPAD_RIGHT, 16);
-
-    g_LastXInput = state.Gamepad;
-    g_IsControllerActive = true;
 }
 
 void ProcessDPadInjection() {
@@ -333,19 +244,13 @@ void __fastcall Hooked_CInputManager_Update(void* _this, void* edx) {
 
     o_CInputManager_Update(_this);
 
-    XINPUT_STATE xState;
-    if (UpdateActiveXInputSlot(xState)) {
-        ProcessNativeXInputInjection(xState);
-        g_InjectedThisFrame = true;
-    }
-    else if (!g_InjectedThisFrame) {
+    // Allow the manual D-Pad event injector to run for ALL controllers, 
+    // including XInput, since we are wiping the raw hardware buffer.
+    if (!g_InjectedThisFrame) {
         ProcessDPadInjection();
+        g_InjectedThisFrame = true; // Mark as injected to be perfectly safe against double-fires
     }
 }
-
-// =================================================================================
-// 3. THE DEFINITION, UI, & LOGIC INTERCEPTORS 
-// =================================================================================
 
 void __fastcall Hooked_ProcessBoastInput(void* _this, void* edx, const EngineInputEvent* event, void* processed_input) {
     if (g_IsControllerActive && event->DeviceType == 1 && event->EventType == 19) {
@@ -458,10 +363,6 @@ void __fastcall Hooked_SetCameraManagerDef(void* _this, void* edx, void** new_de
     o_SetCameraManagerDef(_this, override_def);
 }
 
-// =================================================================================
-// 4. THE CORE UPDATE LOOP & LIVE PUPPETEER
-// =================================================================================
-
 void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
 
     g_pPlayerGui = _this;
@@ -477,7 +378,6 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
         g_LastControllerState = false;
         g_CrossfadeAlpha = 0.0f;
         g_ActiveXInputSlot = (DWORD)-1;
-        memset(&g_LastXInput, 0, sizeof(g_LastXInput));
     }
 
     if (!g_ShadowObjectsInitialized) {
@@ -643,10 +543,6 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
     o_CPlayerGui_Update(_this, paused);
 }
 
-// =================================================================================
-// 5. DIRECTINPUT VTABLE HOOKS & XINPUT MUTING
-// =================================================================================
-
 typedef HRESULT(WINAPI* tGetDeviceData)(IDirectInputDevice8W* _this, DWORD cbObjectData, LPDIDEVICEOBJECTDATA rgdod, LPDWORD pdwInOut, DWORD dwFlags);
 tGetDeviceData oGetDeviceData = nullptr;
 
@@ -685,35 +581,76 @@ HRESULT WINAPI HookedSetCooperativeLevel(IDirectInputDevice8W* _this, HWND hwnd,
 }
 
 HRESULT WINAPI HookedGetDeviceState(IDirectInputDevice8W* _this, DWORD cbData, LPVOID lpvData) {
-    // We let Fable natively populate and scale the buffer FIRST.
-    // This perfectly formats lX, lY, lRx, lRy to Fable's expected native bounds (-1000 to +1000 usually)
     HRESULT hr = oGetDeviceState(_this, cbData, lpvData);
+    if (FAILED(hr)) return hr;
 
-    if (SUCCEEDED(hr) && cbData == sizeof(DIJOYSTATE)) {
+    if (cbData == sizeof(DIJOYSTATE) || cbData == sizeof(DIJOYSTATE2)) {
         DIJOYSTATE* js = (DIJOYSTATE*)lpvData;
 
-        if (g_ActiveXInputSlot != (DWORD)-1) {
-            // Mute Windows Wrapper DInput buttons so Native Event Injection has full control
-            ZeroMemory(js->rgbButtons, sizeof(js->rgbButtons));
-            js->rgdwPOV[0] = -1;
+        XINPUT_STATE xState;
+        bool isXInputConnected = false;
 
-            // --- THE ELEGANT AXIS FIX ---
-            // Fable already pulled the XInput data and natively scaled it inside oGetDeviceState!
-            // BUT Windows puts the right stick on Rx/Ry, while Fable specifically expects it on Z/Rz.
-            // All we do is move the already-scaled data to the Z axis!
-            js->lZ = js->lRx;
-            js->lRz = js->lRy;
+        if (DynXInputGetState) {
+            for (DWORD i = 0; i < 4; i++) {
+                if (DynXInputGetState(i, &xState) == ERROR_SUCCESS) {
+                    if (xState.Gamepad.wButtons != 0 ||
+                        xState.Gamepad.bLeftTrigger > 30 || xState.Gamepad.bRightTrigger > 30 ||
+                        abs(xState.Gamepad.sThumbLX) > 8000 || abs(xState.Gamepad.sThumbLY) > 8000 ||
+                        abs(xState.Gamepad.sThumbRX) > 8000 || abs(xState.Gamepad.sThumbRY) > 8000)
+                    {
+                        g_ActiveXInputSlot = i;
+                    }
+                    if (g_ActiveXInputSlot == i) {
+                        isXInputConnected = true;
+                        break;
+                    }
+                }
+            }
+        }
 
+        if (isXInputConnected) {
             g_IsControllerActive = true;
+            ZeroMemory(js->rgbButtons, sizeof(js->rgbButtons));
+
+            if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_X)              js->rgbButtons[0] = 0x80;
+            if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_Y)              js->rgbButtons[1] = 0x80;
+            if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) js->rgbButtons[2] = 0x80;
+            if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_A)              js->rgbButtons[3] = 0x80;
+            if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_B)              js->rgbButtons[4] = 0x80;
+            if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER)  js->rgbButtons[5] = 0x80;
+
+            if (xState.Gamepad.bLeftTrigger > 30)                        js->rgbButtons[6] = 0x80;
+            if (xState.Gamepad.bRightTrigger > 30)                       js->rgbButtons[7] = 0x80;
+
+            if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_THUMB)     js->rgbButtons[8] = 0x80;
+            if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB)    js->rgbButtons[9] = 0x80;
+            if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_START)          js->rgbButtons[10] = 0x80;
+            if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_BACK)           js->rgbButtons[11] = 0x80;
+
+            WORD xpadMask = 0;
+            if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_UP)    xpadMask |= DPAD_MASK_UP;
+            if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN)  xpadMask |= DPAD_MASK_DOWN;
+            if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT)  xpadMask |= DPAD_MASK_LEFT;
+            if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) xpadMask |= DPAD_MASK_RIGHT;
+            g_CurrentDPadMask = xpadMask;
+
+            if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_UP)         js->rgdwPOV[0] = 0;
+            else if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) js->rgdwPOV[0] = 9000;
+            else if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN)  js->rgdwPOV[0] = 18000;
+            else if (xState.Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT)  js->rgdwPOV[0] = 27000;
+            else                                                          js->rgdwPOV[0] = -1;
+
+            js->lX = xState.Gamepad.sThumbLX;
+            js->lY = -xState.Gamepad.sThumbLY;
+            js->lZ = xState.Gamepad.sThumbRX;
+            js->lRz = xState.Gamepad.sThumbRY;
+
             return hr;
         }
 
-        // --- FALLBACK STADIA / DPAD LOGIC ---
         TrackStadiaPOV(js->rgdwPOV[0]);
-
         for (int i = 0; i < 32; i++) { if (js->rgbButtons[i] & 0x80) g_IsControllerActive = true; }
         for (int i = 0; i < 4; i++) { if (js->rgdwPOV[i] != -1 && js->rgdwPOV[i] != 65535) g_IsControllerActive = true; }
-
         if (!g_IsControllerActive) return DIERR_NOTACQUIRED;
     }
     return hr;
@@ -725,51 +662,126 @@ HRESULT WINAPI HookedGetDeviceData(IDirectInputDevice8W* _this, DWORD cbObjectDa
 
     DIDEVICEINSTANCEW diDevInfo;
     diDevInfo.dwSize = sizeof(DIDEVICEINSTANCEW);
+    DWORD devType = 0;
     if (SUCCEEDED(_this->GetDeviceInfo(&diDevInfo))) {
-        DWORD devType = diDevInfo.dwDevType & 0xFF;
-
-        if (devType == DI8DEVTYPE_MOUSE) {
-            bool significantInput = false;
-            for (DWORD i = 0; i < *pdwInOut; i++) {
-                DWORD ofs = rgdod[i].dwOfs;
-                int data = (int)rgdod[i].dwData;
-                if (ofs >= 0x0C && ofs <= 0x0F && data != 0) significantInput = true;
-                if ((ofs == 0x00 || ofs == 0x04) && (data > 2 || data < -2)) significantInput = true;
-            }
-            if (significantInput && g_IsControllerActive) {
-                g_IsControllerActive = false;
-                g_ActiveXInputSlot = (DWORD)-1;
-            }
-            return hr;
-        }
-
-        if (devType == DI8DEVTYPE_KEYBOARD) {
-            bool keyPressed = false;
-            for (DWORD i = 0; i < *pdwInOut; i++) {
-                if ((rgdod[i].dwData & 0x80) != 0) keyPressed = true;
-            }
-            if (keyPressed && g_IsControllerActive) {
-                g_IsControllerActive = false;
-                g_ActiveXInputSlot = (DWORD)-1;
-            }
-            return hr;
-        }
+        devType = diDevInfo.dwDevType & 0xFF;
     }
 
-    if (g_ActiveXInputSlot != (DWORD)-1) {
-        *pdwInOut = 0;
-        return DI_OK;
+    if (devType == DI8DEVTYPE_MOUSE) {
+        bool significantInput = false;
+        for (DWORD i = 0; i < *pdwInOut; i++) {
+            DWORD ofs = rgdod[i].dwOfs;
+            int data = (int)rgdod[i].dwData;
+            if (ofs >= 0x0C && ofs <= 0x0F && data != 0) significantInput = true;
+            if ((ofs == 0x00 || ofs == 0x04) && (data > 2 || data < -2)) significantInput = true;
+        }
+        if (significantInput && g_IsControllerActive) {
+            g_IsControllerActive = false;
+            g_ActiveXInputSlot = (DWORD)-1;
+        }
+        return hr;
+    }
+
+    if (devType == DI8DEVTYPE_KEYBOARD) {
+        bool keyPressed = false;
+        for (DWORD i = 0; i < *pdwInOut; i++) {
+            if ((rgdod[i].dwData & 0x80) != 0) keyPressed = true;
+        }
+        if (keyPressed && g_IsControllerActive) {
+            g_IsControllerActive = false;
+            g_ActiveXInputSlot = (DWORD)-1;
+        }
+        return hr;
+    }
+
+    XINPUT_STATE xState;
+    bool isXInputConnected = false;
+
+    if (DynXInputGetState) {
+        for (DWORD i = 0; i < 4; i++) {
+            if (DynXInputGetState(i, &xState) == ERROR_SUCCESS) {
+                if (xState.Gamepad.wButtons != 0 ||
+                    xState.Gamepad.bLeftTrigger > 30 || xState.Gamepad.bRightTrigger > 30 ||
+                    abs(xState.Gamepad.sThumbLX) > 8000 || abs(xState.Gamepad.sThumbLY) > 8000 ||
+                    abs(xState.Gamepad.sThumbRX) > 8000 || abs(xState.Gamepad.sThumbRY) > 8000)
+                {
+                    g_ActiveXInputSlot = i;
+                }
+                if (g_ActiveXInputSlot == i) {
+                    isXInputConnected = true;
+                    break;
+                }
+            }
+        }
     }
 
     if (!g_IsControllerActive) g_IsControllerActive = true;
 
     for (DWORD i = 0; i < *pdwInOut; i++) {
         DWORD originalOffset = rgdod[i].dwOfs;
-        if (originalOffset >= 0x30 && originalOffset <= 0x3F) {
-            rgdod[i].dwOfs = TranslateStadiaButtonOffset(originalOffset);
+        DWORD originalData = rgdod[i].dwData;
+
+        if (isXInputConnected) {
+            if (originalOffset == 0x0C) {
+                rgdod[i].dwOfs = 0x08;
+            }
+            else if (originalOffset == 0x10) {
+                rgdod[i].dwOfs = 0x14;
+                rgdod[i].dwData = originalData;
+            }
+            else if (originalOffset == 0x08) {
+                bool currentLT = (xState.Gamepad.bLeftTrigger > 30);
+                bool currentRT = (xState.Gamepad.bRightTrigger > 30);
+
+                if (currentLT != g_LT_State) {
+                    g_LT_State = currentLT;
+                    rgdod[i].dwOfs = 0x36;
+                    rgdod[i].dwData = currentLT ? 0x80 : 0x00;
+                }
+                else if (currentRT != g_RT_State) {
+                    g_RT_State = currentRT;
+                    rgdod[i].dwOfs = 0x37;
+                    rgdod[i].dwData = currentRT ? 0x80 : 0x00;
+                }
+                else {
+                    if (!currentLT && !currentRT && (g_LT_State || g_RT_State)) {
+                        rgdod[i].dwOfs = g_RT_State ? 0x37 : 0x36;
+                        rgdod[i].dwData = 0x00;
+                        g_LT_State = false;
+                        g_RT_State = false;
+                    }
+                    else {
+                        rgdod[i].dwOfs = 0xFFFFFFFF;
+                    }
+                }
+            }
+            else if (originalOffset >= 0x30 && originalOffset <= 0x3F) {
+                DWORD targetedOffset = originalOffset;
+                switch (originalOffset) {
+                case 0x30: targetedOffset = 0x33; break;
+                case 0x31: targetedOffset = 0x34; break;
+                case 0x32: targetedOffset = 0x30; break;
+                case 0x33: targetedOffset = 0x31; break;
+                case 0x34: targetedOffset = 0x35; break;
+                case 0x35: targetedOffset = 0x32; break;
+                case 0x36: targetedOffset = 0x3B; break;
+                case 0x37: targetedOffset = 0x3A; break;
+                case 0x38: targetedOffset = 0x38; break;
+                case 0x39: targetedOffset = 0x39; break;
+                }
+                rgdod[i].dwOfs = targetedOffset;
+            }
+            else if (originalOffset == DIJOFS_POV(0)) {
+                TrackStadiaPOV(originalData);
+            }
         }
-        else if (originalOffset == DIJOFS_POV(0)) {
-            TrackStadiaPOV(rgdod[i].dwData);
+        else {
+            if (originalOffset >= 0x30 && originalOffset <= 0x3F) {
+                rgdod[i].dwOfs = TranslateStadiaButtonOffset(originalOffset);
+            }
+            else if (originalOffset == DIJOFS_POV(0)) {
+                TrackStadiaPOV(originalData);
+            }
         }
     }
     return hr;
@@ -811,10 +823,6 @@ void HookDInputVTable() {
     }
     pDI->Release();
 }
-
-// =================================================================================
-// 6. DEPLOYMENT & MAIN THREAD
-// =================================================================================
 
 void InjectGUIHotswapHooks() {
     if (MH_CreateHook((LPVOID)Retail::ADDR_CINPUTMANAGER_UPDATE, &Hooked_CInputManager_Update, (LPVOID*)&o_CInputManager_Update) == MH_OK) {
