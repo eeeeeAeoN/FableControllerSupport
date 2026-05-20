@@ -15,6 +15,7 @@
 std::ofstream g_Log;
 std::mutex g_LogMutex;
 
+/*
 void Log(const std::string& message) {
     std::lock_guard<std::mutex> lock(g_LogMutex);
     if (g_Log.is_open()) {
@@ -22,6 +23,7 @@ void Log(const std::string& message) {
         g_Log.flush();
     }
 }
+*/
 
 typedef DWORD(WINAPI* XInputGetState_t)(DWORD dwUserIndex, XINPUT_STATE* pState);
 XInputGetState_t DynXInputGetState = nullptr;
@@ -33,7 +35,7 @@ void InitializeXInput() {
 
     if (hXInput) {
         DynXInputGetState = (XInputGetState_t)GetProcAddress(hXInput, "XInputGetState");
-        if (DynXInputGetState) Log("XInput dynamically loaded successfully.");
+        //if (DynXInputGetState) Log("XInput dynamically loaded successfully.");
     }
 }
 
@@ -369,7 +371,7 @@ void __fastcall Hooked_CPlayerGui_Update(void* _this, void* edx, bool paused) {
 
     static void* g_LastPlayerGuiInstance = nullptr;
     if (g_LastPlayerGuiInstance != _this) {
-        Log("New Session Detected. Resetting Caches.");
+        //Log("New Session Detected. Resetting Caches.");
         g_LastPlayerGuiInstance = _this;
         g_ShadowObjectsInitialized = false;
         g_PCAbilityButtons = nullptr;
@@ -806,20 +808,20 @@ void HookDInputVTable() {
 
         if (MH_CreateHook(vTable[9], &HookedGetDeviceState, (LPVOID*)&oGetDeviceState) == MH_OK) {
             MH_EnableHook(vTable[9]);
-            Log("Successfully hooked IDirectInputDevice8::GetDeviceState");
+            //Log("Successfully hooked IDirectInputDevice8::GetDeviceState");
         }
         if (MH_CreateHook(vTable[10], &HookedGetDeviceData, (LPVOID*)&oGetDeviceData) == MH_OK) {
             MH_EnableHook(vTable[10]);
-            Log("Successfully hooked IDirectInputDevice8::GetDeviceData");
+            //Log("Successfully hooked IDirectInputDevice8::GetDeviceData");
         }
         if (MH_CreateHook(vTable[13], &HookedSetCooperativeLevel, (LPVOID*)&oSetCooperativeLevel) == MH_OK) {
             MH_EnableHook(vTable[13]);
-            Log("Successfully hooked IDirectInputDevice8::SetCooperativeLevel (Alt-Tab Fix)");
+            //Log("Successfully hooked IDirectInputDevice8::SetCooperativeLevel (Alt-Tab Fix)");
         }
         pDevice->Release();
     }
     else {
-        Log("CRITICAL: Failed to create dummy DirectInput device. Hooks aborted.");
+        //Log("CRITICAL: Failed to create dummy DirectInput device. Hooks aborted.");
     }
     pDI->Release();
 }
@@ -856,7 +858,7 @@ void InjectGUIHotswapHooks() {
     if (Retail::ADDR_BOASTUI_PROCESSINPUT != 0x0) {
         if (MH_CreateHook((LPVOID)Retail::ADDR_BOASTUI_PROCESSINPUT, &Hooked_ProcessBoastInput, (LPVOID*)&o_ProcessBoastInput) == MH_OK) {
             MH_EnableHook((LPVOID)Retail::ADDR_BOASTUI_PROCESSINPUT);
-            Log("Boast UI Input Hook Deployed.");
+            //Log("Boast UI Input Hook Deployed.");
         }
     }
 
@@ -878,8 +880,8 @@ void InjectGUIHotswapHooks() {
 }
 
 static DWORD WINAPI MainThread(LPVOID) {
-    g_Log.open("EgoCore_Hook.log", std::ios::out | std::ios::trunc);
-    Log("EgoCore Engine Initializing...");
+    //g_Log.open("EgoCore_Hook.log", std::ios::out | std::ios::trunc);
+    //Log("EgoCore Engine Initializing...");
 
     if (MH_Initialize() == MH_OK) {
         InitializeXInput();
