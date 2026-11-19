@@ -157,6 +157,25 @@ namespace Retail {
     constexpr uintptr_t ADDR_SET_CONTROL_SCHEME = 0x00446EF0;
     constexpr uintptr_t ADDR_PACTIVE_REDEFINER = 0x013B8AC4;
     constexpr uintptr_t ADDR_PACTIVE_KEY_REDEFINER = 0x013B8AC8;
+
+    // PC UI Hotbar & Spell Bar Assignment Addresses (verified in Fable.exe)
+    constexpr uintptr_t ADDR_CTCINVENTORY_CTOR                 = 0x00590D32;
+    constexpr uintptr_t ADDR_GET_NUM_QUICKACCESS_BUTTONS       = 0x00445950;
+    constexpr uintptr_t ADDR_CTCINVENTORY_ASSIGNTHINGPC        = 0x00584B86;
+    constexpr uintptr_t ADDR_CTCINVENTORY_UNASSIGNTHINGPC      = 0x00584F15;
+    constexpr uintptr_t ADDR_CTCINVABILITIES_GETABILITYPDEF    = 0x005EDFD9;
+    constexpr uintptr_t ADDR_CTCINVABILITIES_ASSIGNABILITYPC   = 0x005F0DC5;
+    constexpr uintptr_t ADDR_CTCINVABILITIES_UNASSIGNABILITYPC = 0x005F1320;
+    constexpr uintptr_t ADDR_CTCINVABILITIES_RESETASSIGNEDPC   = 0x005F6A6F;
+    constexpr uintptr_t ADDR_CLIST_GPREVIOUSSELECTED           = 0x013B8A98;
+
+    // Hotbar Page 2 (RT -> LT for Slots 5-8) Addresses (verified in Fable.exe)
+    constexpr uintptr_t ADDR_GET_NUM_CS_BUTTONS                = 0x00445960;
+    constexpr uintptr_t ADDR_CINPUTPROCESS_QA_PROCESSINPUT     = 0x0068E510;
+    constexpr uintptr_t ADDR_CDRAW_QA_ICONS_DRAW               = 0x00652FA4;
+    constexpr uintptr_t ADDR_CTCINVENTORY_GET_QA_GRAPHIC       = 0x00581FA4;
+    constexpr uintptr_t ADDR_CTCINVENTORY_GET_QA_ITEM          = 0x00581E33;
+    constexpr uintptr_t ADDR_CTCINVENTORY_GET_QA_DEF           = 0x00581DDB;
 }
 
 bool g_IsControllerActive = false;
@@ -175,6 +194,10 @@ bool g_OriginalTooltipNew = true;
 
 static bool g_LT_State = false;
 static bool g_RT_State = false;
+static bool g_HotbarLTBeforeRT = false;
+static bool g_HotbarPage2 = false;
+static bool g_InProcessQAInput = false;
+static bool g_InDrawQA = false;
 
 DWORD g_ActiveXInputSlot = (DWORD)-1;
 
@@ -1266,11 +1289,14 @@ void __fastcall Hooked_CInputManager_Update(void* _this, void* edx) {
 
     // Recover controller focus/cursor state even if mouse/keyboard cleared g_IsControllerActive
     // or if DirectInput GetDeviceData returned 0 buffered items for an XInput controller.
-    PollXInputActivity(nullptr);
+    XINPUT_STATE xState = {};
+    bool hasXInput = PollXInputActivity(&xState);
     if (g_CurrentDPadMask != 0) {
         g_IsControllerActive = true;
         SetCursorHidden(true, "DPad");
     }
+    bool rtNow = (hasXInput && xState.Gamepad.bRightTrigger > 30);
+    bool ltNow = (hasXInput && xState.Gamepad.bLeftTrigger > 30);
     if (_this) {
         EngineInputEvent* first = *(EngineInputEvent**)((uintptr_t)_this + 0x10);
         EngineInputEvent* last  = *(EngineInputEvent**)((uintptr_t)_this + 0x14);
@@ -1280,6 +1306,8 @@ void __fastcall Hooked_CInputManager_Update(void* _this, void* edx) {
                     if (cur->EventType == 19 || cur->EventType == 20) {
                         g_IsControllerActive = true;
                         SetCursorHidden(true, "InputMgr_JoyBtn");
+                        if (cur->JoystickButton == 8) rtNow = true;
+                        if (cur->JoystickButton == 7) ltNow = true;
                     }
                     else if (cur->EventType == 17 || cur->EventType == 18) {
                         float x = *(float*)((uintptr_t)cur + 0);
@@ -1291,6 +1319,26 @@ void __fastcall Hooked_CInputManager_Update(void* _this, void* edx) {
                     }
                 }
             }
+        }
+    }
+
+    if (!g_IsControllerActive || !g_pPlayerGui || !g_UseXboxGuiDef) {
+        g_HotbarLTBeforeRT = false;
+        g_HotbarPage2 = false;
+    }
+    else {
+        bool showSpecial = *(bool*)((uintptr_t)g_pPlayerGui + Retail::OFFSET_SHOW_SPECIAL_BUTTONS);
+        if (!ltNow) {
+            g_HotbarLTBeforeRT = false;
+            g_HotbarPage2 = false;
+        }
+        else if (!rtNow) {
+            g_HotbarLTBeforeRT = true;
+            g_HotbarPage2 = false;
+        }
+        else {
+            // Both RT and LT are held: activate Page 2 (slots 5-8) only if RT was held first.
+            g_HotbarPage2 = (!g_HotbarLTBeforeRT && showSpecial);
         }
     }
 
@@ -2205,8 +2253,532 @@ static bool IG_HandleOptionsSubmenuInput(void* inputProcess, void* tcInv, const 
     return false;
 }
 
+// ---- PC UI Hotbar & Spell Bar Assignment (Controller Slot-Picker Mode) ----
+static constexpr int IG_MAX_CONTAINMENT_SLOTS = 32;
+
+struct IGContainmentSlot {
+    void* comp = nullptr;
+    uint32_t slotIndex = 0; // 0-based index for AssignThingPC / AssignAbilityPC
+};
+
+struct IGHotbarAssignState {
+    bool     active = false;
+    void*    tcInv = nullptr;
+    void*    tcAbilities = nullptr;
+    void*    activeList = nullptr;
+    bool     isSpell = false;
+    int32_t  payloadId = 0;       // thingDefIdx (item/expression) or EHeroAbility (spell)
+    bool     inSpellBar = false;  // false = PC_EXPRESSION_ITEM_CONTAINMENT_*, true = PC_SPELL_CONTAINMENT_*
+    int      hotbarIdx = 0;
+    int      spellIdx = 0;
+    void*    hoveredSlot = nullptr;
+    float    slotOrigZoom[2] = { 1.0f, 1.0f };
+    int8_t   slotOrigLayer = 0;
+    int      stickXDir = 0;
+    int      stickYDir = 0;
+    DWORD    stickRepeatTick = 0;
+};
+static IGHotbarAssignState g_HotbarAssign;
+static bool g_HotbarSwallowSelect = false;
+static bool g_HotbarSwallowBack = false;
+
+static void* IG_GetActiveFocusedList() {
+    uintptr_t head = *(uintptr_t*)Retail::ADDR_CLIST_GPREVIOUSSELECTED;
+    if (!IsSanePtr((void*)head)) return nullptr;
+    uintptr_t first = *(uintptr_t*)head;
+    if (!IsSanePtr((void*)first) || first == head) return nullptr;
+    void* list = *(void**)(first + 8);
+    if (!IsSanePtr(list) || !IsSanePtr(*(void**)list)) return nullptr;
+    if (FE_GetType(list) != 8u || !IG_IsObservingEvent(list, 1)) return nullptr;
+    return list;
+}
+
+static bool IG_ReadDragIconPayload(void* dragIcon, bool& outIsSpell, int32_t& outPayload) {
+    outIsSpell = false;
+    outPayload = 0;
+    if (!IsSanePtr(dragIcon)) return false;
+
+    void* pList = *(void**)((uintptr_t)dragIcon + 0x1A0); // CDraggable::PActionsOnDropped
+    if (!IsSanePtr(pList)) return false;
+    uintptr_t head = *(uintptr_t*)pList;
+    if (!IsSanePtr((void*)head)) return false;
+
+    int guard = 0;
+    for (uintptr_t node = *(uintptr_t*)head; IsSanePtr((void*)node) && node != head && guard < 32; node = *(uintptr_t*)node, ++guard) {
+        void* pAction = *(void**)(node + 8);
+        if (!IsSanePtr(pAction)) continue;
+        uint32_t actionType = *(uint32_t*)pAction;
+        if (actionType != 253u && actionType != 246u) continue;
+
+        uintptr_t pHead = *(uintptr_t*)((uintptr_t)pAction + 4);
+        if (!IsSanePtr((void*)pHead)) continue;
+        uintptr_t pNode = *(uintptr_t*)pHead;
+        if (!IsSanePtr((void*)pNode) || pNode == pHead) continue;
+
+        void* pParam = *(void**)(pNode + 8);
+        if (!IsSanePtr(pParam)) continue;
+        int32_t val = *(int32_t*)((uintptr_t)pParam + 8);
+        if (val != 0) {
+            outIsSpell = (actionType == 246u);
+            outPayload = val;
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint32_t IG_GetVectorDwordCount(const void* obj, ptrdiff_t firstOff, ptrdiff_t lastOff) {
+    if (!IsSanePtr(obj)) return 0u;
+    uintptr_t first = *(uintptr_t*)((uintptr_t)obj + firstOff);
+    uintptr_t last  = *(uintptr_t*)((uintptr_t)obj + lastOff);
+    if (!first || last <= first) return 0u;
+    return (uint32_t)((last - first) >> 2);
+}
+
+static void* IG_FindContainmentRoot(void* tcInv, void* activeList, bool isSpell) {
+    // Walk up from activeList so we always hit the currently open screen's subtree
+    // (e.g. MAGIC_LIST vs EXPRESSIONS_LIST vs ITEMS_LIST), never a hidden sibling screen.
+    int depth = 0;
+    for (void* cur = activeList; IsSanePtr(cur) && depth < 16; cur = FE_GetParent(cur), ++depth) {
+        if (isSpell && IsSanePtr(FE_FindChild(cur, "PC_SPELL_CONTAINMENT_1"))) return cur;
+        if (!isSpell && IsSanePtr(FE_FindChild(cur, "PC_EXPRESSION_ITEM_CONTAINMENT_1"))) return cur;
+    }
+
+    if (!IsSanePtr(tcInv)) return nullptr;
+    uintptr_t vecFirst = *(uintptr_t*)((uintptr_t)tcInv + 0x0C);
+    uintptr_t vecLast  = *(uintptr_t*)((uintptr_t)tcInv + 0x10);
+    if (!vecFirst || vecLast <= vecFirst) return nullptr;
+
+    if (isSpell) {
+        for (uintptr_t p = vecFirst; p + 4 <= vecLast; p += 4) {
+            void* root = *(void**)p;
+            if (!IsSanePtr(root)) continue;
+            if (void* magicRoot = FE_FindChild(root, "MAGIC_LIST")) return magicRoot;
+        }
+    }
+    for (uintptr_t p = vecFirst; p + 4 <= vecLast; p += 4) {
+        void* root = *(void**)p;
+        if (!IsSanePtr(root)) continue;
+        if (IsSanePtr(FE_FindChild(root, "PC_EXPRESSION_ITEM_CONTAINMENT_1")) ||
+            IsSanePtr(FE_FindChild(root, "PC_SPELL_CONTAINMENT_1"))) {
+            return root;
+        }
+    }
+    return nullptr;
+}
+
+static void IG_CollectNamedSlots(void* container, uint32_t maxSlots, const char* prefix, IGContainmentSlot outSlots[IG_MAX_CONTAINMENT_SLOTS], int& outCount) {
+    outCount = 0;
+    if (!IsSanePtr(container)) return;
+    if (maxSlots > (uint32_t)IG_MAX_CONTAINMENT_SLOTS) maxSlots = (uint32_t)IG_MAX_CONTAINMENT_SLOTS;
+    for (uint32_t i = 0; i < maxSlots; ++i) {
+        char name[64];
+        snprintf(name, sizeof(name), "%s%u", prefix, i + 1u);
+        void* slot = FE_FindChild(container, name);
+        if (IsSanePtr(slot)) {
+            outSlots[outCount++] = { slot, i };
+        }
+    }
+}
+
+static void IG_CollectContainmentSlots(
+    void* tcInv, void* tcAbilities, void* activeList, bool isSpell,
+    IGContainmentSlot outHotbar[IG_MAX_CONTAINMENT_SLOTS], int& outHotbarCount,
+    IGContainmentSlot outSpell[IG_MAX_CONTAINMENT_SLOTS], int& outSpellCount)
+{
+    outHotbarCount = 0;
+    outSpellCount = 0;
+    void* screenRoot = IG_FindContainmentRoot(tcInv, activeList, isSpell);
+    if (!IsSanePtr(screenRoot)) return;
+
+    IG_CollectNamedSlots(
+        screenRoot,
+        IG_GetVectorDwordCount(tcInv, 0x148, 0x14C),
+        "PC_EXPRESSION_ITEM_CONTAINMENT_",
+        outHotbar, outHotbarCount);
+
+    if (isSpell && IsSanePtr(tcAbilities)) {
+        IG_CollectNamedSlots(
+            screenRoot,
+            IG_GetVectorDwordCount(tcAbilities, 0x17C, 0x180),
+            "PC_SPELL_CONTAINMENT_",
+            outSpell, outSpellCount);
+    }
+}
+
+static void IG_SetSlotHovered(void* slotComp, bool hovered) {
+    if (!IsSanePtr(slotComp) || !IsSanePtr(*(void**)slotComp)) return;
+    typedef void(__thiscall* HoverFn_t)(void*);
+    auto fn = *(HoverFn_t*)(*(uintptr_t*)slotComp + (hovered ? 572 : 576)); // CHoverable::OnHovered / OnUnhovered
+    fn(slotComp);
+}
+
+static void IG_SetComponentZoom(void* comp, const float zoom[2]) {
+    typedef void(__thiscall* SetZoom_t)(void*, const float*);
+    auto fn = *(SetZoom_t*)(*(uintptr_t*)comp + 44); // CComponent::SetZoom
+    fn(comp, zoom);
+}
+
+static void IG_UnfocusCurrentSlot() {
+    void* slot = g_HotbarAssign.hoveredSlot;
+    if (!IsSanePtr(slot) || !IsSanePtr(*(void**)slot)) {
+        g_HotbarAssign.hoveredSlot = nullptr;
+        return;
+    }
+    IG_SetSlotHovered(slot, false);
+    IG_SetComponentZoom(slot, g_HotbarAssign.slotOrigZoom);
+    *(int8_t*)((uintptr_t)slot + 0x12F) = g_HotbarAssign.slotOrigLayer;
+    g_HotbarAssign.hoveredSlot = nullptr;
+}
+
+static void IG_FocusHotbarSlot(void* targetSlotComp) {
+    if (!IsSanePtr(targetSlotComp) || !IsSanePtr(*(void**)targetSlotComp)) return;
+    if (g_HotbarAssign.hoveredSlot == targetSlotComp) return;
+    IG_UnfocusCurrentSlot();
+
+    g_HotbarAssign.slotOrigZoom[0] = *(float*)((uintptr_t)targetSlotComp + 0x5C);
+    g_HotbarAssign.slotOrigZoom[1] = *(float*)((uintptr_t)targetSlotComp + 0x60);
+    g_HotbarAssign.slotOrigLayer   = *(int8_t*)((uintptr_t)targetSlotComp + 0x12F);
+    g_HotbarAssign.hoveredSlot     = targetSlotComp;
+
+    IG_SetSlotHovered(targetSlotComp, true);
+    float zoomed[2] = { g_HotbarAssign.slotOrigZoom[0] * 1.18f, g_HotbarAssign.slotOrigZoom[1] * 1.18f };
+    IG_SetComponentZoom(targetSlotComp, zoomed);
+    *(int8_t*)((uintptr_t)targetSlotComp + 0x12F) = (int8_t)(g_HotbarAssign.slotOrigLayer - 1);
+}
+
+static void IG_ExitHotbarAssignMode(bool restoreVisuals) {
+    if (!g_HotbarAssign.active) return;
+    if (restoreVisuals) {
+        IG_UnfocusCurrentSlot();
+    }
+    g_HotbarAssign = IGHotbarAssignState{};
+}
+
+static bool IG_ValidateHotbarAssignState(void* tcInv) {
+    if (!g_HotbarAssign.active) return false;
+    if (IG_IsWorldLoadingOrResetting() || !IsSanePtr(tcInv) || tcInv != g_HotbarAssign.tcInv) {
+        IG_ExitHotbarAssignMode(false);
+        return false;
+    }
+    uint32_t openMenu = *(uint32_t*)((uintptr_t)tcInv + 0x21C);
+    if (openMenu != 1u && openMenu != 3u) {
+        IG_ExitHotbarAssignMode(false);
+        return false;
+    }
+    if (!g_IsControllerActive || IG_IsExclusivelyObserved() || IG_GetActiveFocusedList() != g_HotbarAssign.activeList) {
+        IG_ExitHotbarAssignMode(true);
+        return false;
+    }
+    return true;
+}
+
+static void IG_AssignToFocusedSlot(const IGContainmentSlot& slot) {
+    void* tcInv       = g_HotbarAssign.tcInv;
+    void* tcAbilities = g_HotbarAssign.tcAbilities;
+    bool  isSpell     = g_HotbarAssign.isSpell;
+    bool  inSpellBar  = g_HotbarAssign.inSpellBar;
+    int32_t payloadId = g_HotbarAssign.payloadId;
+
+    // Restore focused slot zoom/layer & hover state before slot mutation replaces child icons.
+    IG_ExitHotbarAssignMode(true);
+
+    if (!inSpellBar) {
+        int32_t thingDefIdx = payloadId;
+        if (isSpell) {
+            thingDefIdx = 0;
+            if (payloadId > 0 && IsSanePtr(tcAbilities)) {
+                void* defPtr = nullptr;
+                typedef void** (__thiscall* GetAbDef_t)(void*, void**, int);
+                ((GetAbDef_t)Retail::ADDR_CTCINVABILITIES_GETABILITYPDEF)(tcAbilities, &defPtr, payloadId);
+                if (IsSanePtr(defPtr)) {
+                    thingDefIdx = *(int32_t*)((uintptr_t)defPtr + 0x98); // CHeroAbilityDef::DummyObject
+                    int* rc = (int*)((uintptr_t)defPtr + 4);
+                    if (--(*rc) == 0) {
+                        typedef void(__thiscall* Dtor_t)(void*);
+                        (*(Dtor_t*)(*(uintptr_t*)defPtr + 4))(defPtr);
+                    }
+                }
+            }
+        }
+        if (thingDefIdx > 0 && IsSanePtr(tcInv)) {
+            typedef void(__thiscall* AssignThingPC_t)(void*, int32_t, uint32_t, void*);
+            ((AssignThingPC_t)Retail::ADDR_CTCINVENTORY_ASSIGNTHINGPC)(tcInv, thingDefIdx, slot.slotIndex, slot.comp);
+        }
+    }
+    else if (isSpell && IsSanePtr(tcAbilities)) {
+        typedef void(__thiscall* AssignAbPC_t)(void*, int32_t, uint32_t, void*);
+        typedef void(__thiscall* ResetAbPC_t)(void*);
+        ((AssignAbPC_t)Retail::ADDR_CTCINVABILITIES_ASSIGNABILITYPC)(tcAbilities, payloadId, slot.slotIndex, slot.comp);
+        ((ResetAbPC_t)Retail::ADDR_CTCINVABILITIES_RESETASSIGNEDPC)(tcAbilities);
+    }
+}
+
+static void IG_ClearFocusedSlot(const IGContainmentSlot& slot) {
+    IG_UnfocusCurrentSlot();
+
+    if (!g_HotbarAssign.inSpellBar) {
+        uint32_t qaCount = IG_GetVectorDwordCount(g_HotbarAssign.tcInv, 0x148, 0x14C);
+        uintptr_t qaFirst = *(uintptr_t*)((uintptr_t)g_HotbarAssign.tcInv + 0x148);
+        if (slot.slotIndex < qaCount && *(int32_t*)(qaFirst + 4 * slot.slotIndex) != 0) {
+            typedef void(__thiscall* UnAssignThingPC_t)(void*, uint32_t, void*);
+            ((UnAssignThingPC_t)Retail::ADDR_CTCINVENTORY_UNASSIGNTHINGPC)(g_HotbarAssign.tcInv, slot.slotIndex, slot.comp);
+        }
+    }
+    else if (g_HotbarAssign.isSpell && IsSanePtr(g_HotbarAssign.tcAbilities)) {
+        uint32_t abCount = IG_GetVectorDwordCount(g_HotbarAssign.tcAbilities, 0x17C, 0x180);
+        uintptr_t abFirst = *(uintptr_t*)((uintptr_t)g_HotbarAssign.tcAbilities + 0x17C);
+        if (slot.slotIndex < abCount && *(int32_t*)(abFirst + 4 * slot.slotIndex) != 0) {
+            typedef void(__thiscall* UnAssignAbPC_t)(void*, uint32_t, void*);
+            typedef void(__thiscall* ResetAbPC_t)(void*);
+            ((UnAssignAbPC_t)Retail::ADDR_CTCINVABILITIES_UNASSIGNABILITYPC)(g_HotbarAssign.tcAbilities, slot.slotIndex, slot.comp);
+            ((ResetAbPC_t)Retail::ADDR_CTCINVABILITIES_RESETASSIGNEDPC)(g_HotbarAssign.tcAbilities);
+        }
+    }
+
+    IG_FocusHotbarSlot(slot.comp);
+}
+
+static bool IG_HandleHotbarAssignInput(
+    void* inputProcess, void* cPlayer, void* tcInv, const EngineInputEvent* ev, void* processedInput)
+{
+    bool isJoyBtnEv = (ev->DeviceType == 1 && (ev->EventType == 19 || ev->EventType == 20 || ev->EventType == 21));
+    bool isSelect = IG_IsEventGameAction(inputProcess, 25, ev) || IG_IsEventGameAction(inputProcess, 33, ev) ||
+                    (isJoyBtnEv && ev->JoystickButton == 4);
+    bool isBack   = IG_IsEventGameAction(inputProcess, 34, ev) || IG_IsEventGameAction(inputProcess, 76, ev) ||
+                    (isJoyBtnEv && ev->JoystickButton == 5);
+    bool isBtnX   = IG_IsEventGameAction(inputProcess, 35, ev) || (isJoyBtnEv && ev->JoystickButton == 1);
+    bool isBtnY   = IG_IsEventGameAction(inputProcess, 36, ev) || (isJoyBtnEv && ev->JoystickButton == 2);
+
+    if (!g_HotbarAssign.active) {
+        if (g_HotbarSwallowSelect && isSelect) {
+            if (IG_IsBtnPressed(ev)) {
+                g_HotbarSwallowSelect = false;
+            } else {
+                if (IG_IsBtnReleased(ev)) g_HotbarSwallowSelect = false;
+                IG_MarkPerformed(processedInput);
+                return true;
+            }
+        }
+        if (g_HotbarSwallowBack && isBack) {
+            if (IG_IsBtnPressed(ev)) {
+                g_HotbarSwallowBack = false;
+            } else {
+                if (IG_IsBtnReleased(ev)) g_HotbarSwallowBack = false;
+                IG_MarkPerformed(processedInput);
+                return true;
+            }
+        }
+    }
+
+    if (IG_IsExclusivelyObserved() || !IsSanePtr(tcInv)) {
+        if (g_HotbarAssign.active) IG_ValidateHotbarAssignState(tcInv);
+        g_HotbarSwallowSelect = false;
+        g_HotbarSwallowBack = false;
+        return false;
+    }
+
+    uint32_t openMenu = *(uint32_t*)((uintptr_t)tcInv + 0x21C);
+    if (openMenu != 1u && openMenu != 3u) {
+        if (g_HotbarAssign.active) IG_ValidateHotbarAssignState(tcInv);
+        g_HotbarSwallowSelect = false;
+        g_HotbarSwallowBack = false;
+        return false;
+    }
+
+    if (!g_HotbarAssign.active) {
+        if (!isBtnX || !IG_IsBtnPressed(ev)) return false;
+
+        void* activeList = IG_GetActiveFocusedList();
+        if (!activeList) return false;
+
+        int selIdx = -1, rowCount = 0;
+        void* activeRow = IG_GetListSelectedRow(activeList, selIdx, rowCount);
+        if (!activeRow) return false;
+
+        void* dragIcon = FE_FindChild(activeRow, "PC_EXPRESSION_ITEM_ASSIGNMENT_ICON");
+        if (!dragIcon) dragIcon = FE_FindChild(activeRow, "PC_SPELL_ASSIGNMENT_ICON");
+        if (!IsSanePtr(dragIcon)) return false;
+
+        bool isSpell = false;
+        int32_t payloadId = 0;
+        if (!IG_ReadDragIconPayload(dragIcon, isSpell, payloadId)) return false;
+
+        void* tcAbilities = IG_GetControlledThingComponent(cPlayer, 111);
+        if (isSpell && !IsSanePtr(tcAbilities)) return false;
+
+        IGContainmentSlot hotbarSlots[IG_MAX_CONTAINMENT_SLOTS], spellSlots[IG_MAX_CONTAINMENT_SLOTS];
+        int hotbarCount = 0, spellCount = 0;
+        IG_CollectContainmentSlots(tcInv, tcAbilities, activeList, isSpell, hotbarSlots, hotbarCount, spellSlots, spellCount);
+        if (hotbarCount <= 0 && (!isSpell || spellCount <= 0)) return false;
+
+        g_HotbarAssign = IGHotbarAssignState{};
+        g_HotbarAssign.active      = true;
+        g_HotbarAssign.tcInv       = tcInv;
+        g_HotbarAssign.tcAbilities = tcAbilities;
+        g_HotbarAssign.activeList  = activeList;
+        g_HotbarAssign.isSpell     = isSpell;
+        g_HotbarAssign.payloadId   = payloadId;
+        g_HotbarAssign.inSpellBar  = (isSpell && spellCount > 0) || (hotbarCount <= 0);
+
+        const IGContainmentSlot& initialSlot = g_HotbarAssign.inSpellBar ? spellSlots[0] : hotbarSlots[0];
+        IG_FocusHotbarSlot(initialSlot.comp);
+
+        IG_MarkPerformed(processedInput);
+        return true;
+    }
+
+    if (!IG_ValidateHotbarAssignState(tcInv)) return false;
+
+    IGContainmentSlot hotbarSlots[IG_MAX_CONTAINMENT_SLOTS], spellSlots[IG_MAX_CONTAINMENT_SLOTS];
+    int hotbarCount = 0, spellCount = 0;
+    IG_CollectContainmentSlots(tcInv, g_HotbarAssign.tcAbilities, g_HotbarAssign.activeList, g_HotbarAssign.isSpell, hotbarSlots, hotbarCount, spellSlots, spellCount);
+
+    if ((g_HotbarAssign.inSpellBar && (!g_HotbarAssign.isSpell || spellCount <= 0)) ||
+        (!g_HotbarAssign.inSpellBar && hotbarCount <= 0)) {
+        IG_ExitHotbarAssignMode(true);
+        return false;
+    }
+
+    if (hotbarCount > 0) {
+        if (g_HotbarAssign.hotbarIdx < 0) g_HotbarAssign.hotbarIdx = 0;
+        if (g_HotbarAssign.hotbarIdx >= hotbarCount) g_HotbarAssign.hotbarIdx = hotbarCount - 1;
+    }
+    if (spellCount > 0) {
+        if (g_HotbarAssign.spellIdx < 0) g_HotbarAssign.spellIdx = 0;
+        if (g_HotbarAssign.spellIdx >= spellCount) g_HotbarAssign.spellIdx = spellCount - 1;
+    }
+
+    auto getCurrentSlot = [&]() -> const IGContainmentSlot& {
+        return g_HotbarAssign.inSpellBar ? spellSlots[g_HotbarAssign.spellIdx] : hotbarSlots[g_HotbarAssign.hotbarIdx];
+    };
+
+    auto stepSlot = [&](int delta) {
+        if (g_HotbarAssign.isSpell && hotbarCount > 0 && spellCount > 0) {
+            int total = hotbarCount + spellCount;
+            int lin = g_HotbarAssign.inSpellBar ? (hotbarCount + g_HotbarAssign.spellIdx) : g_HotbarAssign.hotbarIdx;
+            lin = (lin + delta + total) % total;
+            if (lin < hotbarCount) {
+                g_HotbarAssign.inSpellBar = false;
+                g_HotbarAssign.hotbarIdx = lin;
+            } else {
+                g_HotbarAssign.inSpellBar = true;
+                g_HotbarAssign.spellIdx = lin - hotbarCount;
+            }
+        }
+        else if (g_HotbarAssign.inSpellBar) {
+            g_HotbarAssign.spellIdx = (g_HotbarAssign.spellIdx + delta + spellCount) % spellCount;
+        }
+        else {
+            g_HotbarAssign.hotbarIdx = (g_HotbarAssign.hotbarIdx + delta + hotbarCount) % hotbarCount;
+        }
+        IG_FocusHotbarSlot(getCurrentSlot().comp);
+    };
+
+    auto toggleBar = [&]() {
+        if (!g_HotbarAssign.isSpell || hotbarCount <= 0 || spellCount <= 0) return;
+        g_HotbarAssign.inSpellBar = !g_HotbarAssign.inSpellBar;
+        IG_FocusHotbarSlot(getCurrentSlot().comp);
+    };
+
+    if (ev->EventType == 17) {
+        float xy[2] = { 0.0f, 0.0f };
+        typedef void(__thiscall* GetJoy_t)(const void*, float*);
+        ((GetJoy_t)Retail::ADDR_CINPUTEVENT_GET_JOYSTICK_POS)(ev, xy);
+
+        if (fabsf(xy[0]) < 0.35f) {
+            g_HotbarAssign.stickXDir = 0;
+            g_HotbarAssign.stickRepeatTick = 0;
+        }
+        if (fabsf(xy[1]) < 0.35f) {
+            g_HotbarAssign.stickYDir = 0;
+        }
+
+        if (xy[0] < -0.6f || xy[0] > 0.6f) {
+            int dir = (xy[0] < 0.0f) ? -1 : 1;
+            DWORD nowTick = GetTickCount();
+            if (g_HotbarAssign.stickXDir != dir || (nowTick - g_HotbarAssign.stickRepeatTick) >= 180) {
+                g_HotbarAssign.stickXDir = dir;
+                g_HotbarAssign.stickRepeatTick = nowTick;
+                stepSlot(dir);
+            }
+        }
+        else if (xy[1] < -0.6f || xy[1] > 0.6f) {
+            int yDir = (xy[1] < 0.0f) ? 1 : -1;
+            if (g_HotbarAssign.stickYDir != yDir) {
+                g_HotbarAssign.stickYDir = yDir;
+                toggleBar();
+            }
+        }
+
+        IG_MarkPerformed(processedInput);
+        return true;
+    }
+
+    if (IG_IsEventGameAction(inputProcess, 39, ev) || IG_IsEventGameAction(inputProcess, 40, ev)) {
+        if (IG_IsBtnPressed(ev)) {
+            stepSlot(IG_IsEventGameAction(inputProcess, 39, ev) ? -1 : 1);
+        }
+        IG_MarkPerformed(processedInput);
+        return true;
+    }
+
+    bool isShoulderToggle = isJoyBtnEv && (ev->JoystickButton == 6 || ev->JoystickButton == 3);
+    if (IG_IsEventGameAction(inputProcess, 37, ev) || IG_IsEventGameAction(inputProcess, 38, ev) || isShoulderToggle) {
+        if (IG_IsBtnPressed(ev)) {
+            toggleBar();
+        }
+        IG_MarkPerformed(processedInput);
+        return true;
+    }
+
+    if (isSelect) {
+        if (IG_IsBtnPressed(ev)) {
+            g_HotbarSwallowSelect = true;
+            IG_AssignToFocusedSlot(getCurrentSlot());
+        }
+        IG_MarkPerformed(processedInput);
+        return true;
+    }
+
+    if (isBtnX || isBtnY) {
+        if (IG_IsBtnPressed(ev)) {
+            IG_ClearFocusedSlot(getCurrentSlot());
+        }
+        IG_MarkPerformed(processedInput);
+        return true;
+    }
+
+    if (isBack) {
+        if (IG_IsBtnPressed(ev)) {
+            g_HotbarSwallowBack = true;
+            IG_ExitHotbarAssignMode(true);
+        }
+        IG_MarkPerformed(processedInput);
+        return true;
+    }
+
+    return false;
+}
+
 static void IG_SyncControllerFocus() {
-    if (!g_IsControllerActive || IG_IsWorldLoadingOrResetting()) return;
+    if (IG_IsWorldLoadingOrResetting()) {
+        if (g_HotbarAssign.active) IG_ExitHotbarAssignMode(false);
+        g_HotbarSwallowSelect = false;
+        g_HotbarSwallowBack = false;
+        return;
+    }
+
+    if (!g_IsControllerActive) {
+        if (g_HotbarAssign.active) {
+            void* player = IG_GetMainPlayer();
+            void* tcInv = player ? IG_GetControlledThingComponent(player, 17) : nullptr;
+            IG_ValidateHotbarAssignState(tcInv);
+        }
+        g_HotbarSwallowSelect = false;
+        g_HotbarSwallowBack = false;
+        return;
+    }
 
     void* dlg = nullptr;
     void* btn0 = nullptr;
@@ -2255,6 +2827,9 @@ static void IG_SyncControllerFocus() {
         else {
             IG_PruneStaleOptionsFocus(nullptr);
         }
+        if (g_HotbarAssign.active) {
+            IG_ValidateHotbarAssignState(tcInv);
+        }
     }
 }
 
@@ -2285,6 +2860,12 @@ char __fastcall Hooked_CTCInventory_IsSaveMenuReceivingInput(void* _this, void* 
 void __fastcall Hooked_CInputProcessInventory_ProcessInput(
     void* _this, void* edx, const EngineInputEvent* ev, void* processedInput)
 {
+    if (g_HotbarAssign.active && !g_IsControllerActive) {
+        void* cPlayer = *(void**)((uintptr_t)_this + 24);
+        void* tcInv = IG_GetControlledThingComponent(cPlayer, 17);
+        IG_ValidateHotbarAssignState(tcInv);
+    }
+
     if (g_IsControllerActive && ev && ev->DeviceType == 1) {
         // Priority 1: Active OK / Yes-No popup modals in ConcurrentExclusiveObservers
         void* dlg = nullptr;
@@ -2313,6 +2894,11 @@ void __fastcall Hooked_CInputProcessInventory_ProcessInput(
 
         // Priority 3: Options submenus (Gameplay, Audio, Video sliders/toggles & Redefine Keys + Apply/Cancel/Defaults)
         if (IG_HandleOptionsSubmenuInput(_this, tcInv, ev, processedInput)) {
+            return;
+        }
+
+        // Priority 3.5: PC UI Hotbar & Spell Bar Assignment (Items, Expressions, Magic)
+        if (IG_HandleHotbarAssignInput(_this, cPlayer, tcInv, ev, processedInput)) {
             return;
         }
 
@@ -2403,6 +2989,95 @@ void __fastcall Hooked_DrawIcon(void* _this, void* edx, void* info, void* tlpos,
     o_DrawIcon(_this, info, tlpos, alpha, primitive_index, back_graphic, icon_graphic, special);
 }
 
+// ---- Hotbar Page 2 (RT -> LT for Slots 5-8 while preserving LT target lock) ----
+typedef char(__thiscall* CInputProcessQA_ProcessInput_t)(void* _this, const void* ev, void* processedInput);
+static CInputProcessQA_ProcessInput_t o_CInputProcessQA_ProcessInput = nullptr;
+
+typedef int(__thiscall* GetNumCSButtons_t)(void* _this);
+static GetNumCSButtons_t o_GetNumCSButtons = nullptr;
+
+typedef void(__thiscall* CDrawQAIcons_Draw_t)(void* _this, void* prepareInfo);
+static CDrawQAIcons_Draw_t o_CDrawQAIcons_Draw = nullptr;
+
+typedef int(__thiscall* CTCInv_GetQAGraphic_t)(void* _this, int index);
+static CTCInv_GetQAGraphic_t o_CTCInv_GetQAGraphic = nullptr;
+
+typedef int(__thiscall* CTCInv_GetQAItem_t)(void* _this, uint32_t index);
+static CTCInv_GetQAItem_t o_CTCInv_GetQAItem = nullptr;
+
+typedef void** (__thiscall* CTCInv_GetQADef_t)(void* _this, void** outDef, uint32_t index);
+static CTCInv_GetQADef_t o_CTCInv_GetQADef = nullptr;
+
+char __fastcall Hooked_CInputProcessQA_ProcessInput(void* _this, void* edx, const void* ev, void* processedInput) {
+    g_InProcessQAInput = true;
+    char ret = o_CInputProcessQA_ProcessInput(_this, ev, processedInput);
+    g_InProcessQAInput = false;
+    return ret;
+}
+
+int __fastcall Hooked_GetNumCSButtons(void* _this, void* edx) {
+    int real = o_GetNumCSButtons(_this);
+    if (g_InProcessQAInput && g_IsControllerActive && g_UseXboxGuiDef && g_HotbarPage2) {
+        return real + 4;
+    }
+    return real;
+}
+
+void __fastcall Hooked_CDrawQAIcons_Draw(void* _this, void* edx, void* prepareInfo) {
+    bool page2 = (g_IsControllerActive && g_UseXboxGuiDef && g_HotbarPage2);
+    if (!page2) {
+        o_CDrawQAIcons_Draw(_this, prepareInfo);
+        return;
+    }
+
+    int* pCharging = (int*)((uintptr_t)_this + 44);
+    int origCharging = *pCharging;
+    if (origCharging >= 8 && origCharging < 12) {
+        *pCharging = origCharging - 4;
+    }
+    else if (origCharging >= 4 && origCharging < 8) {
+        *pCharging = 99;
+    }
+
+    g_InDrawQA = true;
+    o_CDrawQAIcons_Draw(_this, prepareInfo);
+    g_InDrawQA = false;
+    *pCharging = origCharging;
+}
+
+int __fastcall Hooked_CTCInv_GetQAGraphic(void* _this, void* edx, int index) {
+    if (g_InDrawQA && g_IsControllerActive && g_UseXboxGuiDef && g_HotbarPage2 && index >= 0 && index < 4) {
+        index += 4;
+    }
+    if (index < 0 || (uint32_t)index >= IG_GetVectorDwordCount(_this, 0x148, 0x14C)) {
+        return 0;
+    }
+    return o_CTCInv_GetQAGraphic(_this, index);
+}
+
+int __fastcall Hooked_CTCInv_GetQAItem(void* _this, void* edx, uint32_t index) {
+    uint32_t csCount = IG_GetVectorDwordCount(_this, 0x154, 0x158);
+    if (g_InDrawQA && g_IsControllerActive && g_UseXboxGuiDef && g_HotbarPage2 && index >= csCount && index < csCount + 4u) {
+        index += 4u;
+    }
+    if (index >= csCount && index < csCount + 32u && (index - csCount) >= IG_GetVectorDwordCount(_this, 0x148, 0x14C)) {
+        return 0;
+    }
+    return o_CTCInv_GetQAItem(_this, index);
+}
+
+void** __fastcall Hooked_CTCInv_GetQADef(void* _this, void* edx, void** outDef, uint32_t index) {
+    uint32_t csCount = IG_GetVectorDwordCount(_this, 0x154, 0x158);
+    if (g_InDrawQA && g_IsControllerActive && g_UseXboxGuiDef && g_HotbarPage2 && index >= csCount && index < csCount + 4u) {
+        index += 4u;
+    }
+    if (index >= csCount && index < csCount + 32u && (index - csCount) >= IG_GetVectorDwordCount(_this, 0x148, 0x14C)) {
+        if (outDef) *outDef = nullptr;
+        return outDef;
+    }
+    return o_CTCInv_GetQADef(_this, outDef, index);
+}
+
 bool __fastcall Hooked_IsToggleZTarget(void* _this, void* edx) {
     if (g_IsControllerActive) return false;
     return o_IsToggleZTarget(_this);
@@ -2435,9 +3110,14 @@ static bool  g_AbilityLoadActive = false;
 static int   g_SavedAbilityBtnCount = -1;
 static bool  g_InventoryLoadActive = false;
 static void* g_CurrentTCInventory = nullptr;
+static bool  g_InTCInventoryCtor = false;
 
 typedef int(__thiscall* GetNumAbilityButtons_t)(void* _this);
 static GetNumAbilityButtons_t o_GetNumAbilityButtons = nullptr;
+typedef void* (__thiscall* CTCInventory_Ctor_t)(void* _this, void* thing);
+static CTCInventory_Ctor_t o_CTCInventory_Ctor = nullptr;
+typedef int(__thiscall* GetNumQuickAccessButtons_t)(void* _this);
+static GetNumQuickAccessButtons_t o_GetNumQuickAccessButtons = nullptr;
 typedef void(__thiscall* TransferVectorCharString_t)(void* _this, const char* name, int* vec);
 static TransferVectorCharString_t o_TransferVectorCharString = nullptr;
 typedef int(__thiscall* TCAbilitySerialise_t)(void* _this, void* a2, int a3);
@@ -2450,6 +3130,21 @@ int __fastcall Hooked_GetNumAbilityButtons(void* _this, void* edx) {
     if (g_AbilityLoadActive && g_SavedAbilityBtnCount >= 0 && real > g_SavedAbilityBtnCount) {
         LogFmt("GetNumAbilityButtons clamped %d -> %d (saved vector size)", real, g_SavedAbilityBtnCount);
         return g_SavedAbilityBtnCount;
+    }
+    return real;
+}
+
+void* __fastcall Hooked_CTCInventory_Ctor(void* _this, void* edx, void* thing) {
+    g_InTCInventoryCtor = true;
+    void* ret = o_CTCInventory_Ctor(_this, thing);
+    g_InTCInventoryCtor = false;
+    return ret;
+}
+
+int __fastcall Hooked_GetNumQuickAccessButtons(void* _this, void* edx) {
+    int real = o_GetNumQuickAccessButtons(_this);
+    if (g_InTCInventoryCtor && real < 9) {
+        return 9;
     }
     return real;
 }
@@ -2595,6 +3290,13 @@ static void ResetInGameSessionState(const char* reason, void* playerGui) {
     g_InGameOptLastSelChild = -1;
     g_InGameOptRowChangeTick = 0;
     g_ApplyingPCCleanup = false;
+    IG_ExitHotbarAssignMode(false);
+    g_HotbarSwallowSelect = false;
+    g_HotbarSwallowBack = false;
+    g_HotbarLTBeforeRT = false;
+    g_HotbarPage2 = false;
+    g_InProcessQAInput = false;
+    g_InDrawQA = false;
     memset(g_XboxAbilityBuffer, 0, sizeof(g_XboxAbilityBuffer));
     memset(g_XboxQuickAccessBuffer, 0, sizeof(g_XboxQuickAccessBuffer));
 }
@@ -3167,6 +3869,12 @@ void InjectGUIHotswapHooks() {
     if (MH_CreateHook((LPVOID)Retail::ADDR_CTCINVENTORY_SERIALISE, &Hooked_CTCInventory_Serialise, (LPVOID*)&o_CTCInventory_Serialise) == MH_OK) {
         MH_EnableHook((LPVOID)Retail::ADDR_CTCINVENTORY_SERIALISE);
     }
+    if (MH_CreateHook((LPVOID)Retail::ADDR_CTCINVENTORY_CTOR, &Hooked_CTCInventory_Ctor, (LPVOID*)&o_CTCInventory_Ctor) == MH_OK) {
+        MH_EnableHook((LPVOID)Retail::ADDR_CTCINVENTORY_CTOR);
+    }
+    if (MH_CreateHook((LPVOID)Retail::ADDR_GET_NUM_QUICKACCESS_BUTTONS, &Hooked_GetNumQuickAccessButtons, (LPVOID*)&o_GetNumQuickAccessButtons) == MH_OK) {
+        MH_EnableHook((LPVOID)Retail::ADDR_GET_NUM_QUICKACCESS_BUTTONS);
+    }
     if (MH_CreateHook((LPVOID)Retail::ADDR_CMAINGAMECOMPONENT_SHUTDOWN, &Hooked_CMainGameComponent_Shutdown, (LPVOID*)&o_CMainGameComponent_Shutdown) == MH_OK) {
         MH_EnableHook((LPVOID)Retail::ADDR_CMAINGAMECOMPONENT_SHUTDOWN);
     }
@@ -3190,6 +3898,24 @@ void InjectGUIHotswapHooks() {
     }
     if (MH_CreateHook((LPVOID)Retail::ADDR_DRAW_ICON, &Hooked_DrawIcon, (LPVOID*)&o_DrawIcon) == MH_OK) {
         MH_EnableHook((LPVOID)Retail::ADDR_DRAW_ICON);
+    }
+    if (MH_CreateHook((LPVOID)Retail::ADDR_CINPUTPROCESS_QA_PROCESSINPUT, &Hooked_CInputProcessQA_ProcessInput, (LPVOID*)&o_CInputProcessQA_ProcessInput) == MH_OK) {
+        MH_EnableHook((LPVOID)Retail::ADDR_CINPUTPROCESS_QA_PROCESSINPUT);
+    }
+    if (MH_CreateHook((LPVOID)Retail::ADDR_GET_NUM_CS_BUTTONS, &Hooked_GetNumCSButtons, (LPVOID*)&o_GetNumCSButtons) == MH_OK) {
+        MH_EnableHook((LPVOID)Retail::ADDR_GET_NUM_CS_BUTTONS);
+    }
+    if (MH_CreateHook((LPVOID)Retail::ADDR_CDRAW_QA_ICONS_DRAW, &Hooked_CDrawQAIcons_Draw, (LPVOID*)&o_CDrawQAIcons_Draw) == MH_OK) {
+        MH_EnableHook((LPVOID)Retail::ADDR_CDRAW_QA_ICONS_DRAW);
+    }
+    if (MH_CreateHook((LPVOID)Retail::ADDR_CTCINVENTORY_GET_QA_GRAPHIC, &Hooked_CTCInv_GetQAGraphic, (LPVOID*)&o_CTCInv_GetQAGraphic) == MH_OK) {
+        MH_EnableHook((LPVOID)Retail::ADDR_CTCINVENTORY_GET_QA_GRAPHIC);
+    }
+    if (MH_CreateHook((LPVOID)Retail::ADDR_CTCINVENTORY_GET_QA_ITEM, &Hooked_CTCInv_GetQAItem, (LPVOID*)&o_CTCInv_GetQAItem) == MH_OK) {
+        MH_EnableHook((LPVOID)Retail::ADDR_CTCINVENTORY_GET_QA_ITEM);
+    }
+    if (MH_CreateHook((LPVOID)Retail::ADDR_CTCINVENTORY_GET_QA_DEF, &Hooked_CTCInv_GetQADef, (LPVOID*)&o_CTCInv_GetQADef) == MH_OK) {
+        MH_EnableHook((LPVOID)Retail::ADDR_CTCINVENTORY_GET_QA_DEF);
     }
 
     if (Retail::ADDR_BOASTUI_PROCESSINPUT != 0x0) {
