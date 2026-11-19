@@ -198,6 +198,9 @@ static bool g_HotbarLTBeforeRT = false;
 static bool g_HotbarPage2 = false;
 static bool g_InProcessQAInput = false;
 static bool g_InDrawQA = false;
+static bool  g_RightStickButtonHeld = false;
+static float g_LookStickX = 0.0f;
+static float g_LookStickY = 0.0f;
 
 DWORD g_ActiveXInputSlot = (DWORD)-1;
 
@@ -1280,6 +1283,139 @@ bool __fastcall Hooked_GFPlayFullScreenXBoxMovie(
     return result;
 }
 
+static bool IsFirstPersonModConfigured() {
+    static bool s_Checked = false;
+    static bool s_Configured = false;
+    if (s_Checked) return s_Configured;
+    s_Checked = true;
+
+    char exePath[MAX_PATH] = {};
+    DWORD len = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        Log("FirstPersonView check: failed to resolve Fable executable path.");
+        return false;
+    }
+
+    std::string exeStr(exePath, len);
+    size_t lastSlash = exeStr.find_last_of("\\/");
+    if (lastSlash == std::string::npos) {
+        Log("FirstPersonView check: failed to determine Fable root directory.");
+        return false;
+    }
+
+    std::string rootDir = exeStr.substr(0, lastSlash);
+    std::string iniPath = rootDir + "\\mods.ini";
+    DWORD iniAttrs = GetFileAttributesA(iniPath.c_str());
+    if (iniAttrs == INVALID_FILE_ATTRIBUTES || (iniAttrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        LogFmt("FirstPersonView check: mods.ini not found at %s", iniPath.c_str());
+        return false;
+    }
+
+    bool iniEnabled =
+        (GetPrivateProfileIntA("Mods", "FirstPersonView\\FirstPersonView.dll", 0, iniPath.c_str()) != 0) ||
+        (GetPrivateProfileIntA("Mods", "FirstPersonView/FirstPersonView.dll", 0, iniPath.c_str()) != 0);
+    if (!iniEnabled) {
+        LogFmt("FirstPersonView check: disabled or missing in %s", iniPath.c_str());
+        return false;
+    }
+
+    char modsDirBuf[MAX_PATH] = {};
+    GetPrivateProfileStringA("Settings", "ModsDirectory", "Mods", modsDirBuf, MAX_PATH, iniPath.c_str());
+    std::string rawModsDir(modsDirBuf);
+
+    size_t firstNonSpace = rawModsDir.find_first_not_of(" \t");
+    if (firstNonSpace == std::string::npos) {
+        rawModsDir = "Mods";
+    }
+    else {
+        size_t lastNonSpace = rawModsDir.find_last_not_of(" \t");
+        rawModsDir = rawModsDir.substr(firstNonSpace, lastNonSpace - firstNonSpace + 1);
+    }
+
+    while (rawModsDir.size() >= 2 && rawModsDir[0] == '.' && (rawModsDir[1] == '\\' || rawModsDir[1] == '/')) {
+        rawModsDir.erase(0, 2);
+    }
+    while (!rawModsDir.empty() && (rawModsDir.back() == '\\' || rawModsDir.back() == '/')) {
+        if (rawModsDir.size() == 3 && rawModsDir[1] == ':') break;
+        rawModsDir.pop_back();
+    }
+
+    bool isAbsolute =
+        (rawModsDir.size() >= 2 && rawModsDir[1] == ':') ||
+        (rawModsDir.size() >= 2 && rawModsDir[0] == '\\' && rawModsDir[1] == '\\');
+
+    std::string modsDir;
+    if (isAbsolute) {
+        modsDir = rawModsDir;
+    }
+    else if (rawModsDir.empty() || rawModsDir == ".") {
+        modsDir = rootDir;
+    }
+    else {
+        modsDir = rootDir + "\\" + rawModsDir;
+    }
+
+    while (!modsDir.empty() && (modsDir.back() == '\\' || modsDir.back() == '/')) {
+        if (modsDir.size() == 3 && modsDir[1] == ':') break;
+        modsDir.pop_back();
+    }
+
+    std::string fpModDir = modsDir + "\\FirstPersonView";
+    DWORD dirAttrs = GetFileAttributesA(fpModDir.c_str());
+    bool folderExists = (dirAttrs != INVALID_FILE_ATTRIBUTES && (dirAttrs & FILE_ATTRIBUTE_DIRECTORY) != 0);
+
+    s_Configured = folderExists;
+    LogFmt("FirstPersonView check: mods.ini enabled=1, folder (%s) %s",
+        fpModDir.c_str(), folderExists ? "FOUND" : "NOT FOUND");
+    return s_Configured;
+}
+
+static bool IsFirstPersonModLoaded() {
+    if (!IsFirstPersonModConfigured()) return false;
+    static bool s_Detected = false;
+    if (s_Detected) return true;
+    if (GetModuleHandleA("FirstPersonView.dll") != nullptr) {
+        s_Detected = true;
+        return true;
+    }
+    return false;
+}
+
+static void ApplyRadialDeadzone(float rawX, float rawY, float deadzone, float& outX, float& outY) {
+    if (rawX < -1.0f) rawX = -1.0f;
+    else if (rawX > 1.0f) rawX = 1.0f;
+    if (rawY < -1.0f) rawY = -1.0f;
+    else if (rawY > 1.0f) rawY = 1.0f;
+
+    float mag = sqrtf(rawX * rawX + rawY * rawY);
+    if (mag <= deadzone) {
+        outX = 0.0f;
+        outY = 0.0f;
+        return;
+    }
+
+    float scaled = (mag - deadzone) / (1.0f - deadzone);
+    if (scaled > 1.0f) scaled = 1.0f;
+    float curved = scaled * (0.4f + 0.6f * scaled);
+    outX = (rawX / mag) * curved;
+    outY = (rawY / mag) * curved;
+}
+
+extern "C" {
+    __declspec(dllexport) bool __cdecl FCS_IsControllerActive() {
+        return g_IsControllerActive;
+    }
+
+    __declspec(dllexport) bool __cdecl FCS_IsRightStickButtonHeld() {
+        return g_RightStickButtonHeld;
+    }
+
+    __declspec(dllexport) void __cdecl FCS_GetLookStickAxes(float* outX, float* outY) {
+        if (outX) *outX = g_LookStickX;
+        if (outY) *outY = g_LookStickY;
+    }
+}
+
 void __fastcall Hooked_CInputManager_Update(void* _this, void* edx) {
     g_pInputManager = _this;
     g_LastDPadMask = g_CurrentDPadMask;
@@ -1297,6 +1433,13 @@ void __fastcall Hooked_CInputManager_Update(void* _this, void* edx) {
     }
     bool rtNow = (hasXInput && xState.Gamepad.bRightTrigger > 30);
     bool ltNow = (hasXInput && xState.Gamepad.bLeftTrigger > 30);
+    bool xinputHasActivity = hasXInput && IsXInputActive(xState);
+    bool xinputR3 = (hasXInput && (xState.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB) != 0);
+    bool dinputR3 = false;
+    float dinputLX = 0.0f, dinputLY = 0.0f;
+    float dinputRX = 0.0f, dinputRY = 0.0f;
+    bool hasDInputL = false, hasDInputR = false;
+
     if (_this) {
         EngineInputEvent* first = *(EngineInputEvent**)((uintptr_t)_this + 0x10);
         EngineInputEvent* last  = *(EngineInputEvent**)((uintptr_t)_this + 0x14);
@@ -1308,6 +1451,7 @@ void __fastcall Hooked_CInputManager_Update(void* _this, void* edx) {
                         SetCursorHidden(true, "InputMgr_JoyBtn");
                         if (cur->JoystickButton == 8) rtNow = true;
                         if (cur->JoystickButton == 7) ltNow = true;
+                        if (cur->JoystickButton == 10) dinputR3 = true;
                     }
                     else if (cur->EventType == 17 || cur->EventType == 18) {
                         float x = *(float*)((uintptr_t)cur + 0);
@@ -1316,8 +1460,67 @@ void __fastcall Hooked_CInputManager_Update(void* _this, void* edx) {
                             g_IsControllerActive = true;
                             SetCursorHidden(true, "InputMgr_JoyAxis");
                         }
+                        if (cur->EventType == 17) {
+                            dinputLX = x;
+                            dinputLY = -y;
+                            hasDInputL = true;
+                        }
+                        else {
+                            dinputRX = x;
+                            dinputRY = -y;
+                            hasDInputR = true;
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    bool r3Now = xinputR3 || (!xinputHasActivity && dinputR3);
+    float lx = 0.0f, ly = 0.0f, rx = 0.0f, ry = 0.0f;
+    if (hasXInput) {
+        ApplyRadialDeadzone(xState.Gamepad.sThumbLX / 32767.0f, xState.Gamepad.sThumbLY / 32767.0f, 0.20f, lx, ly);
+        ApplyRadialDeadzone(xState.Gamepad.sThumbRX / 32767.0f, xState.Gamepad.sThumbRY / 32767.0f, 0.20f, rx, ry);
+    }
+    if (!hasXInput || (!xinputHasActivity && lx == 0.0f && ly == 0.0f && rx == 0.0f && ry == 0.0f)) {
+        if (hasDInputL) ApplyRadialDeadzone(dinputLX, dinputLY, 0.20f, lx, ly);
+        if (hasDInputR) ApplyRadialDeadzone(dinputRX, dinputRY, 0.20f, rx, ry);
+    }
+    float combX = lx + rx;
+    float combY = ly + ry;
+    float combMag = sqrtf(combX * combX + combY * combY);
+    if (combMag > 1.0f) {
+        combX /= combMag;
+        combY /= combMag;
+    }
+    g_RightStickButtonHeld = g_IsControllerActive && r3Now;
+    g_LookStickX = g_IsControllerActive ? combX : 0.0f;
+    g_LookStickY = g_IsControllerActive ? combY : 0.0f;
+
+    if (_this && *(void**)Retail::ADDR_PMAINGAMECOMPONENT != nullptr && IsFirstPersonModLoaded()) {
+        EngineInputEvent** pFirst = (EngineInputEvent**)((uintptr_t)_this + 0x10);
+        EngineInputEvent** pLast  = (EngineInputEvent**)((uintptr_t)_this + 0x14);
+        int* pNoStoredEvents      = (int*)((uintptr_t)_this + 0x1C);
+        if (*pFirst && *pLast && *pLast > *pFirst) {
+            EngineInputEvent* writePtr = *pFirst;
+            int removed = 0;
+            for (EngineInputEvent* readPtr = *pFirst; readPtr < *pLast; ++readPtr) {
+                bool isR3Event = (readPtr->DeviceType == 1 &&
+                    (readPtr->EventType == 19 || readPtr->EventType == 20 || readPtr->EventType == 21) &&
+                    readPtr->JoystickButton == 10);
+                if (isR3Event) {
+                    ++removed;
+                }
+                else {
+                    if (writePtr != readPtr) {
+                        *writePtr = *readPtr;
+                    }
+                    ++writePtr;
+                }
+            }
+            if (removed > 0) {
+                *pLast = writePtr;
+                *pNoStoredEvents = (int)(writePtr - *pFirst);
             }
         }
     }
@@ -3297,6 +3500,9 @@ static void ResetInGameSessionState(const char* reason, void* playerGui) {
     g_HotbarPage2 = false;
     g_InProcessQAInput = false;
     g_InDrawQA = false;
+    g_RightStickButtonHeld = false;
+    g_LookStickX = 0.0f;
+    g_LookStickY = 0.0f;
     memset(g_XboxAbilityBuffer, 0, sizeof(g_XboxAbilityBuffer));
     memset(g_XboxQuickAccessBuffer, 0, sizeof(g_XboxQuickAccessBuffer));
 }
